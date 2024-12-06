@@ -22,8 +22,13 @@ use web_rwkv::{
         softmax::softmax_one,
         v4, v5, v6, TokioRuntime,
     },
+    num::Float,
+    tensor::ops::TensorOp,
     wgpu,
 };
+use ops::TensorOpExt;
+
+mod ops;
 
 static RUNTIME: RwLock<Option<Runtime>> = RwLock::new(None);
 
@@ -33,6 +38,24 @@ struct Runtime {
     state: Arc<dyn State + Sync + Send + 'static>,
     context: Context,
     tokio: Arc<tokio::runtime::Runtime>,
+}
+
+/// We need to slightly modify the model structure using hooks.
+fn make_hooks<F: Float>(info: &ModelInfo) -> Result<v6::HookMap<F>> {
+    let mut hooks = v6::HookMap::new();
+
+    for layer in 0..info.num_layer {
+        // add a custom operation before time-mix for each layer
+        hooks.insert(
+            v6::Hook::PreAttTimeDecayActivate(layer),
+            Box::new(move |frame: v6::Frame<F>| {
+                let op = TensorOp::mul_exp(&frame.buffer.time_decay, &frame.buffer.att_k)?;
+                Ok(TensorOp::List(vec![op]))
+            }),
+        );
+    }
+
+    Ok(hooks)
 }
 
 async fn create_context(info: &ModelInfo) -> Result<Context> {
@@ -80,6 +103,7 @@ fn load_runtime(
             .chain((0..quant_nf4).map(|layer| (layer, Quant::NF4)))
             .collect();
 
+        let hooks = make_hooks(&info)?;
         let builder = ModelBuilder::new(&context, model).quant(quant);
         let builder = match rescale {
             Some(rescale) => builder.rescale(rescale),
@@ -112,7 +136,7 @@ fn load_runtime(
             }
             ModelVersion::V6 => {
                 let model = builder.build_v6().await?;
-                let bundle = v6::Bundle::<f16>::new(model, 1);
+                let bundle = v6::Bundle::<f16>::new_with_hooks(model, 1, hooks);
                 let state = Arc::new(bundle.state());
                 let runtime = TokioRuntime::new(bundle).await;
                 Runtime {
