@@ -38,6 +38,7 @@ struct Runtime {
     state: Arc<dyn State + Sync + Send + 'static>,
     context: Context,
     tokio: Arc<tokio::runtime::Runtime>,
+    info: ModelInfo,
 }
 
 /// We need to slightly modify the model structure using hooks.
@@ -120,6 +121,7 @@ fn load_runtime(
                     state,
                     context,
                     tokio,
+                    info,
                 }
             }
             ModelVersion::V5 => {
@@ -132,6 +134,7 @@ fn load_runtime(
                     state,
                     context,
                     tokio,
+                    info,
                 }
             }
             ModelVersion::V6 => {
@@ -144,6 +147,7 @@ fn load_runtime(
                     state,
                     context,
                     tokio,
+                    info,
                 }
             }
             ModelVersion::V7 => todo!(),
@@ -281,12 +285,12 @@ pub unsafe extern "C" fn infer(tokens: *const u16, len: usize, sampler: Sampler)
         } else {
             output
                 .iter()
+                .take(runtime.info.num_vocab)
                 .enumerate()
                 .max_by(|(_, x), (_, y)| x.total_cmp(y))
                 .unwrap()
                 .0 as u16
         }
-
     })
 }
 
