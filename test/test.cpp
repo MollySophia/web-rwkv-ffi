@@ -18,6 +18,8 @@ int main() {
     void (*init)(uint64_t) = (void (*)(uint64_t))GetProcAddress(handle, "init");
     void (*load_with_rescale)(const char *, uintptr_t, uintptr_t, uintptr_t) = (void (*)(const char *, uintptr_t, uintptr_t, uintptr_t))GetProcAddress(handle, "load_with_rescale");
     uint16_t (*infer)(const uint16_t *, uintptr_t, struct Sampler) = (uint16_t (*)(const uint16_t *, uintptr_t, struct Sampler))GetProcAddress(handle, "infer");
+    struct ModelOutput (*infer_raw_last)(const uint16_t *, uintptr_t) = (struct ModelOutput (*)(const uint16_t *, uintptr_t))GetProcAddress(handle, "infer_raw_last");
+    void (*free_raw)(struct ModelOutput) = (void (*)(struct ModelOutput))GetProcAddress(handle, "free_raw");
 #else
     void *handle = dlopen("../target/release/libweb_rwkv_ffi.dylib", RTLD_LAZY);
     if (!handle) {
@@ -28,21 +30,44 @@ int main() {
     void (*init)(uint64_t) = (void (*)(uint64_t))dlsym(handle, "init");
     void (*load_with_rescale)(const char *, uintptr_t, uintptr_t, uintptr_t) = (void (*)(const char *, uintptr_t, uintptr_t, uintptr_t))dlsym(handle, "load_with_rescale");
     uint16_t (*infer)(const uint16_t *, uintptr_t, struct Sampler) = (uint16_t (*)(const uint16_t *, uintptr_t, struct Sampler))dlsym(handle, "infer");
-
+    struct ModelOutput (*infer_raw_last)(const uint16_t *, uintptr_t) = (struct ModelOutput (*)(const uint16_t *, uintptr_t))dlsym(handle, "infer_raw_last");
+    void (*free_raw)(struct ModelOutput) = (void (*)(struct ModelOutput))dlsym(handle, "free_raw");
 #endif
     TRIE_TOKENIZER tokenizer("b_rwkv_vocab_v20230424.txt");
     init(0);
     load_with_rescale("../RWKV-x070-World-0.1B-v2.8-20241210-ctx4096.st", 0, 0, 999);
 
-    std::string prompt_str = "The Eiffel Tower is in the city of";
-    auto prompt_ids = tokenizer.encode(prompt_str);
-    std::vector<uint16_t> prompt(prompt_ids.begin(), prompt_ids.end());
-    struct Sampler sampler = {1.0, 1.0, 0};
-    uint16_t output = infer(prompt.data(), prompt.size(), sampler);
-    std::cout << prompt_str << '[';
-    for (int i = 0; i < 20; i++) {
-        output = infer(&output, 1, sampler);
-        std::cout << tokenizer.decode({output});
+    std::cout << "Testing infer()..." << std::endl;
+    {
+        std::string prompt_str = "The Eiffel Tower is in the city of";
+        auto prompt_ids = tokenizer.encode(prompt_str);
+        std::vector<uint16_t> prompt(prompt_ids.begin(), prompt_ids.end());
+        struct Sampler sampler = {1.0, 1.0, 0};
+        uint16_t output = infer(prompt.data(), prompt.size(), sampler);
+        std::cout << prompt_str << '[';
+        for (int i = 0; i < 20; i++) {
+            output = infer(&output, 1, sampler);
+            std::cout << tokenizer.decode({output});
+        }
     }
+    std::cout << std::endl;
+
+    std::cout << "Testing infer_raw_last()..." << std::endl;
+    {
+        std::string prompt_str = "The Eiffel Tower is in the city of";
+        auto prompt_ids = tokenizer.encode(prompt_str);
+        std::vector<uint16_t> prompt(prompt_ids.begin(), prompt_ids.end());
+        std::cout << prompt_str << std::endl;
+        struct ModelOutput output = infer_raw_last(prompt.data(), prompt.size());
+        std::cout << "output len: " << output.len << std::endl;
+        for (int i = 0; i < 10; i++) {
+            std::cout << output.logits[i] << " ";
+        }
+        std::cout << std::endl;
+        std::cout << "Decoded output: " << tokenizer.decode({(int)(std::max_element(output.logits, output.logits + output.len) - output.logits)}) << std::endl;
+        free_raw(output);
+    }
+    std::cout << std::endl;
+
     return 0;
 }
