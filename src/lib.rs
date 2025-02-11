@@ -6,6 +6,7 @@ use std::{
 
 use anyhow::Result;
 use half::f16;
+use serde::{de::DeserializeSeed, Deserialize};
 use itertools::Itertools;
 use memmap2::Mmap;
 use safetensors::SafeTensors;
@@ -23,7 +24,7 @@ use web_rwkv::{
         v4, v5, v6, v7, TokioRuntime,
     },
     num::Float,
-    tensor::ops::TensorOp,
+    tensor::{ops::TensorOp, serialization::Seed},
     wgpu,
 };
 use ops::TensorOpExt;
@@ -77,6 +78,11 @@ fn make_hooks_extended_v7<F: Float>(info: &ModelInfo) -> Result<v7::HookMap<F>> 
     Ok(hooks)
 }
 
+#[derive(Debug, Deserialize)]
+struct Prefab {
+    info: ModelInfo,
+}
+
 async fn create_context(info: &ModelInfo) -> Result<Context> {
     let instance = wgpu::Instance::default();
     let adapter = instance
@@ -101,6 +107,7 @@ fn load_runtime(
     model: impl AsRef<Path>,
     quant: usize,
     quant_nf4: usize,
+    quant_sf4: usize,
     rescale: Option<usize>,
     extended: bool,
 ) -> Result<Runtime> {
@@ -121,6 +128,7 @@ fn load_runtime(
         let quant = (0..quant)
             .map(|layer| (layer, Quant::Int8))
             .chain((0..quant_nf4).map(|layer| (layer, Quant::NF4)))
+            .chain((0..quant_sf4).map(|layer| (layer, Quant::SF4)))
             .collect();
 
         let builder = ModelBuilder::new(&context, model).quant(quant);
@@ -198,6 +206,84 @@ fn load_runtime(
     })
 }
 
+fn load_runtime_prefab(model: impl AsRef<Path>) -> Result<Runtime> {
+    let tokio = Arc::new(tokio::runtime::Runtime::new()?);
+    let _tokio = tokio.clone();
+
+    _tokio.block_on(async move {
+        let file = File::open(model).await?;
+        let data = unsafe { Mmap::map(&file)? };
+
+        let Prefab { info } = cbor4ii::serde::from_slice::<Prefab>(&data)?;
+
+        let reader = cbor4ii::core::utils::SliceReader::new(&data);
+        let mut deserializer = cbor4ii::serde::Deserializer::new(reader);
+
+        log::info!("{:#?}", info);
+        let context = create_context(&info).await?;
+
+        let runtime = match info.version {
+            ModelVersion::V4 => {
+                let seed: Seed<_, v4::Model> = Seed::new(&context);
+                let model = seed.deserialize(&mut deserializer)?;
+                let bundle = v4::Bundle::<f16>::new(model, 1);
+                let state = Arc::new(bundle.state());
+                let runtime = TokioRuntime::new(bundle).await;
+                Runtime {
+                    runtime,
+                    info,
+                    state,
+                    context,
+                    tokio,
+                }
+            }
+            ModelVersion::V5 => {
+                let seed: Seed<_, v5::Model> = Seed::new(&context);
+                let model = seed.deserialize(&mut deserializer)?;
+                let bundle = v5::Bundle::<f16>::new(model, 1);
+                let state = Arc::new(bundle.state());
+                let runtime = TokioRuntime::new(bundle).await;
+                Runtime {
+                    runtime,
+                    info,
+                    state,
+                    context,
+                    tokio,
+                }
+            }
+            ModelVersion::V6 => {
+                let seed: Seed<_, v6::Model> = Seed::new(&context);
+                let model = seed.deserialize(&mut deserializer)?;
+                let bundle = v6::Bundle::<f16>::new(model, 1);
+                let state = Arc::new(bundle.state());
+                let runtime = TokioRuntime::new(bundle).await;
+                Runtime {
+                    runtime,
+                    info,
+                    state,
+                    context,
+                    tokio,
+                }
+            }
+            ModelVersion::V7 => {
+                let seed: Seed<_, v7::Model> = Seed::new(&context);
+                let model = seed.deserialize(&mut deserializer)?;
+                let bundle = v7::Bundle::<f16>::new(model, 1);
+                let state = Arc::new(bundle.state());
+                let runtime = TokioRuntime::new(bundle).await;
+                Runtime {
+                    runtime,
+                    info,
+                    state,
+                    context,
+                    tokio,
+                }
+            }
+        };
+        Ok(runtime)
+    })
+}
+
 /// Initialize logger and RNG. Call this once before everything.
 #[no_mangle]
 pub extern "C" fn init(seed: u64) {
@@ -221,9 +307,26 @@ pub extern "C" fn seed(seed: u64) {
 ///
 /// The caller must ensure that `model` is valid.
 #[no_mangle]
-pub unsafe extern "C" fn load(model: *const c_char, quant: usize, quant_nf4: usize) {
+pub unsafe extern "C" fn load(model: *const c_char, quant: usize, quant_nf4: usize, quant_sf4: usize) {
     let model = unsafe { CStr::from_ptr(model).to_string_lossy().to_string() };
-    match load_runtime(model, quant, quant_nf4, None, false) {
+    match load_runtime(model, quant, quant_nf4, quant_sf4,None, false) {
+        Ok(runtime) => {
+            let mut rt = RUNTIME.write().unwrap();
+            rt.replace(runtime);
+        }
+        Err(err) => log::error!("{err}"),
+    }
+}
+
+/// Load a runtime from prefab.
+/// 
+/// # Safety
+/// 
+/// The caller must ensure that `model` is valid.
+#[no_mangle]
+pub unsafe extern "C" fn load_prefab(model: *const c_char) {
+    let model = unsafe { CStr::from_ptr(model).to_string_lossy().to_string() };
+    match load_runtime_prefab(model) {
         Ok(runtime) => {
             let mut rt = RUNTIME.write().unwrap();
             rt.replace(runtime);
@@ -242,10 +345,11 @@ pub unsafe extern "C" fn load_with_rescale(
     model: *const c_char,
     quant: usize,
     quant_nf4: usize,
+    quant_sf4: usize,
     rescale: usize,
 ) {
     let model = unsafe { CStr::from_ptr(model).to_string_lossy().to_string() };
-    match load_runtime(model, quant, quant_nf4, Some(rescale), false) {
+    match load_runtime(model, quant, quant_nf4, quant_sf4, Some(rescale), false) {
         Ok(runtime) => {
             let mut rt = RUNTIME.write().unwrap();
             rt.replace(runtime);
@@ -263,10 +367,11 @@ pub unsafe extern "C" fn load_with_rescale(
 pub unsafe extern "C" fn load_extended(
     model: *const c_char,
     quant: usize,
-    quant_nf4: usize
+    quant_nf4: usize,
+    quant_sf4: usize,
 ) {
     let model = unsafe { CStr::from_ptr(model).to_string_lossy().to_string() };
-    match load_runtime(model, quant, quant_nf4, None, true) {
+    match load_runtime(model, quant, quant_nf4, quant_sf4, None, true) {
         Ok(runtime) => {
             let mut rt = RUNTIME.write().unwrap();
             rt.replace(runtime);
