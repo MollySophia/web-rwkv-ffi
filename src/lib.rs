@@ -318,6 +318,24 @@ pub unsafe extern "C" fn load(model: *const c_char, quant: usize, quant_nf4: usi
     }
 }
 
+#[no_mangle]
+pub unsafe extern "C" fn release() {
+    let runtime = {
+        let runtime = RUNTIME.read().unwrap();
+        let Some(runtime) = runtime.clone() else {
+            log::error!("runtime not loaded");
+            return;
+        };
+        runtime
+    };
+    let _ = runtime.runtime;
+    let _ = runtime.context;
+    let _ = runtime.tokio;
+    let _ = runtime.state;
+    let mut rt = RUNTIME.write().unwrap();
+    rt.take();
+}
+
 /// Load a runtime from prefab.
 /// 
 /// # Safety
@@ -520,9 +538,7 @@ pub extern "C" fn get_state() -> StateRaw {
     let tensor = tokio.block_on(async move {
         runtime.state.back(0).await.map_err(|err| log::error!("{err}"))
     }).unwrap();
-    let mut data: Vec<f32> = vec![0.0; tensor.len()];
-    data.copy_from_slice(&tensor);
-    data.into()
+    tensor.to_vec().into()
 }
 
 /// Free the returned state vector created by the get_state function.
