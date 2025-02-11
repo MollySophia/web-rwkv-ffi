@@ -42,9 +42,13 @@ void seed(uint64_t seed);
 /// The caller must ensure that `model` is valid.
 void load(const char *model, uintptr_t quant, uintptr_t quant_nf4, uintptr_t quant_sf4);
 
+void load_prefab(const char *model);
+
 void load_extended(const char *model, uintptr_t quant, uintptr_t quant_nf4, uintptr_t quant_sf4);
 
 void load_with_rescale(const char *model, uintptr_t quant, uintptr_t quant_nf4, uintptr_t quant_sf4, uintptr_t rescale);
+
+void release();
 
 /// Clear the model state.
 void clear_state();
