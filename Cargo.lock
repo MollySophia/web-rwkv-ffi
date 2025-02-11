@@ -186,6 +186,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8318a53db07bb3f8dca91a600466bdb3f2eaadeedfdbcf02e1accbad9271ba50"
 
 [[package]]
+name = "cbor4ii"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "189a2a2e5eec2f203b2bb8bc4c2db55c7253770d2c6bf3ae5f79ace5a15c305f"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "cc"
 version = "1.1.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1675,12 +1684,14 @@ name = "web-rwkv-ffi"
 version = "0.1.2"
 dependencies = [
  "anyhow",
+ "cbor4ii",
  "fastrand",
  "half",
  "itertools",
  "log",
  "memmap2",
  "safetensors",
+ "serde",
  "simple_logger",
  "tokio",
  "web-rwkv",
