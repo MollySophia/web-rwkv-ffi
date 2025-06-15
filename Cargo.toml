@@ -4,7 +4,7 @@ name = "web-rwkv-ffi"
 version = "0.1.2"
 
 [lib]
-crate-type = ["cdylib", "staticlib"]
+crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
 anyhow = "1.0"
@@ -17,5 +17,11 @@ memmap2 = "0.9"
 safetensors = "0.5"
 serde = { version = "1", features = ["derive"] }
 simple_logger = { version = "5.0.0", features = ["stderr"] }
+sysinfo = "0.29"
 tokio = { version = "1.41", features = ["full"] }
 web-rwkv = "0.10.12"
+
+[dev-dependencies]
+anyhow = "1.0"
+simple_logger = { version = "5.0.0", features = ["stderr"] }
+sysinfo = "0.29"

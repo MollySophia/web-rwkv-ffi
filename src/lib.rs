@@ -3,6 +3,7 @@ use std::{
     path::Path,
     sync::{Arc, RwLock},
 };
+use sysinfo::{System, SystemExt, ProcessExt};
 
 use anyhow::Result;
 use half::f16;
@@ -207,28 +208,57 @@ fn load_runtime(
 }
 
 fn load_runtime_prefab(model: impl AsRef<Path>) -> Result<Runtime> {
+    let mut sys = System::new_all();
+    let process_id = std::process::id();
+    
+    let mut print_memory_usage = |stage: &str| {
+        sys.refresh_process(sysinfo::Pid::from(process_id as usize));
+        if let Some(process) = sys.process(sysinfo::Pid::from(process_id as usize)) {
+            let memory_usage_mb = process.memory() as f64 / 1024.0 / 1024.0;
+            log::info!("Memory Usage [{}]: {:.2} MB", stage, memory_usage_mb);
+        }
+    };
+
+    print_memory_usage("Start Loading");
+    
     let tokio = Arc::new(tokio::runtime::Runtime::new()?);
     let _tokio = tokio.clone();
 
     _tokio.block_on(async move {
+        print_memory_usage("After Creating Tokio Runtime");
+        
         let file = File::open(model).await?;
-        let data = unsafe { Mmap::map(&file)? };
+        print_memory_usage("After Opening File");
+        
+        let data = unsafe { Mmap::map(&file) }?;
+        print_memory_usage("After Memory Mapping File");
 
-        let Prefab { info } = cbor4ii::serde::from_slice::<Prefab>(&data)?;
+        let info = {
+            let prefab = cbor4ii::serde::from_slice::<Prefab>(&data)?;
+            prefab.info
+        };
+        print_memory_usage("After Parsing Prefab Info");
 
         let reader = cbor4ii::core::utils::SliceReader::new(&data);
         let mut deserializer = cbor4ii::serde::Deserializer::new(reader);
 
         log::info!("{:#?}", info);
         let context = create_context(&info).await?;
+        print_memory_usage("After Creating Context");
 
         let runtime = match info.version {
             ModelVersion::V4 => {
                 let seed: Seed<_, v4::Model> = Seed::new(&context);
                 let model = seed.deserialize(&mut deserializer)?;
+                print_memory_usage("After Deserializing V4 Model");
+                
                 let bundle = v4::Bundle::<f16>::new(model, 1);
+                print_memory_usage("After Creating V4 Bundle");
+                
                 let state = Arc::new(bundle.state());
                 let runtime = TokioRuntime::new(bundle).await;
+                print_memory_usage("After Creating V4 Runtime");
+                
                 Runtime {
                     runtime,
                     info,
@@ -240,9 +270,15 @@ fn load_runtime_prefab(model: impl AsRef<Path>) -> Result<Runtime> {
             ModelVersion::V5 => {
                 let seed: Seed<_, v5::Model> = Seed::new(&context);
                 let model = seed.deserialize(&mut deserializer)?;
+                print_memory_usage("After Deserializing V5 Model");
+                
                 let bundle = v5::Bundle::<f16>::new(model, 1);
+                print_memory_usage("After Creating V5 Bundle");
+                
                 let state = Arc::new(bundle.state());
                 let runtime = TokioRuntime::new(bundle).await;
+                print_memory_usage("After Creating V5 Runtime");
+                
                 Runtime {
                     runtime,
                     info,
@@ -254,9 +290,15 @@ fn load_runtime_prefab(model: impl AsRef<Path>) -> Result<Runtime> {
             ModelVersion::V6 => {
                 let seed: Seed<_, v6::Model> = Seed::new(&context);
                 let model = seed.deserialize(&mut deserializer)?;
+                print_memory_usage("After Deserializing V6 Model");
+                
                 let bundle = v6::Bundle::<f16>::new(model, 1);
+                print_memory_usage("After Creating V6 Bundle");
+                
                 let state = Arc::new(bundle.state());
                 let runtime = TokioRuntime::new(bundle).await;
+                print_memory_usage("After Creating V6 Runtime");
+                
                 Runtime {
                     runtime,
                     info,
@@ -268,9 +310,15 @@ fn load_runtime_prefab(model: impl AsRef<Path>) -> Result<Runtime> {
             ModelVersion::V7 => {
                 let seed: Seed<_, v7::Model> = Seed::new(&context);
                 let model = seed.deserialize(&mut deserializer)?;
+                print_memory_usage("After Deserializing V7 Model");
+                
                 let bundle = v7::Bundle::<f16>::new(model, 1);
+                print_memory_usage("After Creating V7 Bundle");
+                
                 let state = Arc::new(bundle.state());
                 let runtime = TokioRuntime::new(bundle).await;
+                print_memory_usage("After Creating V7 Runtime");
+                
                 Runtime {
                     runtime,
                     info,
@@ -280,6 +328,7 @@ fn load_runtime_prefab(model: impl AsRef<Path>) -> Result<Runtime> {
                 }
             }
         };
+        print_memory_usage("Loading Complete");
         Ok(runtime)
     })
 }
