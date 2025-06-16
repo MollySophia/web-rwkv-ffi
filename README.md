@@ -27,14 +27,31 @@ pub struct ModelInfoOutput {
     pub num_head: usize,
 }
 
+pub struct StateRaw {
+    pub len: usize,
+    pub data: *mut f32,
+}
+
 /// Initialize logger and RNG. Call this once before everything.
 pub fn init(seed: u64);
 /// Set the RNG seed.
 pub fn seed(seed: u64);
 /// Load a runtime.
-pub fn load(model: *const c_char, quant: usize, quant_nf4: usize);
+pub fn load(model: *const c_char, quant: usize, quant_nf4: usize, quant_sf4: usize);
+/// Load a prefab model.
+pub fn load_prefab(model: *const c_char);
+/// Load a model with rescale.
+pub fn load_with_rescale(model: *const c_char, quant: usize, quant_nf4: usize, quant_sf4: usize, rescale: usize);
+/// Load an extended model (for Othello and other demos).
+pub fn load_extended(model: *const c_char, quant: usize, quant_nf4: usize, quant_sf4: usize);
 /// Clear the model state.
 pub fn clear_state();
+/// Get the model state.
+pub fn get_state() -> StateRaw;
+/// Set the model state.
+pub fn set_state(data: StateRaw);
+/// Free the model state.
+pub fn free_state(state: StateRaw);
 /// Generate the next token prediction given the input tokens and a sampler.
 pub fn infer(tokens: *const u16, len: usize, sampler: Sampler) -> u16;
 /// Compute the model's raw output (next token prediction only) given the input tokens.
@@ -45,4 +62,6 @@ pub fn infer_raw_full(tokens: *const u16, len: usize) -> ModelOutput;
 pub fn free_raw(output: ModelOutput);
 // Returns the model info.
 pub fn get_model_info() -> ModelInfoOutput;
+// Release the model.
+pub fn release();
 ```
