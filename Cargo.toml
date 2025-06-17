@@ -19,7 +19,8 @@ serde = { version = "1", features = ["derive"] }
 simple_logger = { version = "5.0.0", features = ["stderr"] }
 sysinfo = "0.29"
 tokio = { version = "1.41", features = ["full"] }
-web-rwkv = "0.10.12"
+# web-rwkv = "0.10.12"
+web-rwkv = { git = "https://github.com/cryscan/web-rwkv"}
 
 [dev-dependencies]
 anyhow = "1.0"
