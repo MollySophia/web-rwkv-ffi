@@ -15,7 +15,7 @@ use tokio::fs::File;
 use web_rwkv::{
     context::{Context, ContextBuilder, InstanceExt},
     runtime::{
-        infer::{InferInput, InferInputBatch, InferOption, InferOutput},
+        infer::{Rnn, RnnInput, RnnInputBatch, RnnOption, Token},
         loader::Loader,
         model::{
             ContextAutoLimits, ModelBuilder, ModelInfo, ModelVersion, Quant,
@@ -32,11 +32,11 @@ use ops::TensorOpExt;
 
 mod ops;
 
-static RUNTIME: RwLock<Option<Runtime>> = RwLock::new(None);
+static RUNTIME: RwLock<Option<WktvRuntime>> = RwLock::new(None);
 
 #[derive(Clone)]
-struct Runtime {
-    runtime: TokioRuntime<InferInput, InferOutput>,
+struct WktvRuntime {
+    runtime: TokioRuntime<Rnn>,
     info: ModelInfo,
     state: Arc<dyn State + Sync + Send + 'static>,
     context: Context,
@@ -111,7 +111,7 @@ fn load_runtime(
     quant_sf4: usize,
     rescale: Option<usize>,
     extended: bool,
-) -> Result<Runtime> {
+) -> Result<WktvRuntime> {
     let tokio = Arc::new(tokio::runtime::Runtime::new()?);
     let _tokio = tokio.clone();
 
@@ -143,7 +143,7 @@ fn load_runtime(
                 let bundle = v4::Bundle::<f16>::new(model, 1);
                 let state = Arc::new(bundle.state());
                 let runtime = TokioRuntime::new(bundle).await;
-                Runtime {
+                WktvRuntime {
                     runtime,
                     info,
                     state,
@@ -156,7 +156,7 @@ fn load_runtime(
                 let bundle = v5::Bundle::<f16>::new(model, 1);
                 let state = Arc::new(bundle.state());
                 let runtime = TokioRuntime::new(bundle).await;
-                Runtime {
+                WktvRuntime {
                     runtime,
                     info,
                     state,
@@ -175,7 +175,7 @@ fn load_runtime(
                 };
                 let state = Arc::new(bundle.state());
                 let runtime = TokioRuntime::new(bundle).await;
-                Runtime {
+                WktvRuntime {
                     runtime,
                     info,
                     state,
@@ -194,7 +194,7 @@ fn load_runtime(
                 };
                 let state = Arc::new(bundle.state());
                 let runtime = TokioRuntime::new(bundle).await;
-                Runtime {
+                WktvRuntime {
                     runtime,
                     info,
                     state,
@@ -207,7 +207,7 @@ fn load_runtime(
     })
 }
 
-fn load_runtime_prefab(model: impl AsRef<Path>) -> Result<Runtime> {
+fn load_runtime_prefab(model: impl AsRef<Path>) -> Result<WktvRuntime> {
     let mut sys = System::new_all();
     let process_id = std::process::id();
     
@@ -220,7 +220,7 @@ fn load_runtime_prefab(model: impl AsRef<Path>) -> Result<Runtime> {
     };
 
     print_memory_usage("Start Loading");
-    
+
     let tokio = Arc::new(tokio::runtime::Runtime::new()?);
     let _tokio = tokio.clone();
 
@@ -259,7 +259,7 @@ fn load_runtime_prefab(model: impl AsRef<Path>) -> Result<Runtime> {
                 let runtime = TokioRuntime::new(bundle).await;
                 print_memory_usage("After Creating V4 Runtime");
                 
-                Runtime {
+                WktvRuntime {
                     runtime,
                     info,
                     state,
@@ -279,7 +279,7 @@ fn load_runtime_prefab(model: impl AsRef<Path>) -> Result<Runtime> {
                 let runtime = TokioRuntime::new(bundle).await;
                 print_memory_usage("After Creating V5 Runtime");
                 
-                Runtime {
+                WktvRuntime {
                     runtime,
                     info,
                     state,
@@ -299,7 +299,7 @@ fn load_runtime_prefab(model: impl AsRef<Path>) -> Result<Runtime> {
                 let runtime = TokioRuntime::new(bundle).await;
                 print_memory_usage("After Creating V6 Runtime");
                 
-                Runtime {
+                WktvRuntime {
                     runtime,
                     info,
                     state,
@@ -319,7 +319,7 @@ fn load_runtime_prefab(model: impl AsRef<Path>) -> Result<Runtime> {
                 let runtime = TokioRuntime::new(bundle).await;
                 print_memory_usage("After Creating V7 Runtime");
                 
-                Runtime {
+                WktvRuntime {
                     runtime,
                     info,
                     state,
@@ -478,7 +478,10 @@ pub unsafe extern "C" fn infer(tokens: *const u16, len: usize, sampler: Sampler)
         runtime
     };
 
-    let tokens: &[u16] = unsafe { std::slice::from_raw_parts(tokens, len) };
+    let tokens: Vec<Token> = unsafe { std::slice::from_raw_parts(tokens, len) }.iter().map(|t| Token::Token(*t)).collect();
+    // let tokens: Vec<u16> = (0..len)
+    //         .map(|_| fastrand::u16(0..((runtime.info.num_vocab - 1) as u16)))
+    //         .collect();
     if tokens.is_empty() {
         log::error!("input cannot be empty");
         return 0;
@@ -487,16 +490,16 @@ pub unsafe extern "C" fn infer(tokens: *const u16, len: usize, sampler: Sampler)
     let tokio = runtime.tokio.clone();
     tokio.block_on(async move {
         let context = &runtime.context;
-        let mut inference = Some(InferInput::new(
-            vec![InferInputBatch {
-                tokens: tokens.to_vec(),
-                option: InferOption::Last,
+        let mut inference = Some(RnnInput::new(
+            vec![RnnInputBatch {
+                tokens: tokens,
+                option: RnnOption::Last,
             }],
             128,
         ));
         let output = loop {
             let input = inference.take().unwrap();
-            let (input, InferOutput(output)) = match runtime.runtime.infer(input).await {
+            let (input, output) = match runtime.runtime.infer(input).await {
                 Ok(result) => result,
                 Err(err) => {
                     log::error!("Inference error: {err}");
@@ -643,7 +646,7 @@ pub unsafe extern "C" fn infer_raw_last(tokens: *const u16, len: usize) -> Model
         runtime
     };
 
-    let tokens: &[u16] = unsafe { std::slice::from_raw_parts(tokens, len) };
+    let tokens: Vec<Token> = unsafe { std::slice::from_raw_parts(tokens, len) }.iter().map(|t| Token::Token(*t)).collect();
     if tokens.is_empty() {
         log::error!("input cannot be empty");
         return ModelOutput::empty();
@@ -651,16 +654,16 @@ pub unsafe extern "C" fn infer_raw_last(tokens: *const u16, len: usize) -> Model
 
     let tokio = runtime.tokio.clone();
     let output = tokio.block_on(async move {
-        let mut inference = Some(InferInput::new(
-            vec![InferInputBatch {
+        let mut inference = Some(RnnInput::new(
+            vec![RnnInputBatch {
                 tokens: tokens.to_vec(),
-                option: InferOption::Last,
+                option: RnnOption::Last,
             }],
             128,
         ));
         loop {
             let input = inference.take().unwrap();
-            let (input, InferOutput(output)) = match runtime.runtime.infer(input).await {
+            let (input, output) = match runtime.runtime.infer(input).await {
                 Ok(result) => result,
                 Err(err) => {
                     log::error!("Inference error: {err}");
@@ -695,7 +698,7 @@ pub unsafe extern "C" fn infer_raw_full(tokens: *const u16, len: usize) -> Model
         runtime
     };
 
-    let tokens: &[u16] = unsafe { std::slice::from_raw_parts(tokens, len) };
+    let tokens: Vec<Token> = unsafe { std::slice::from_raw_parts(tokens, len) }.iter().map(|t| Token::Token(*t)).collect();
     if tokens.is_empty() {
         log::error!("input cannot be empty");
         return ModelOutput::empty();
@@ -703,17 +706,17 @@ pub unsafe extern "C" fn infer_raw_full(tokens: *const u16, len: usize) -> Model
 
     let tokio = runtime.tokio.clone();
     let output = tokio.block_on(async move {
-        let mut inference = Some(InferInput::new(
-            vec![InferInputBatch {
+        let mut inference = Some(RnnInput::new(
+            vec![RnnInputBatch {
                 tokens: tokens.to_vec(),
-                option: InferOption::Full,
+                option: RnnOption::Full,
             }],
             128,
         ));
         let mut outputs = vec![];
         loop {
             let input = inference.take().unwrap();
-            let (input, InferOutput(output)) = match runtime.runtime.infer(input).await {
+            let (input, output) = match runtime.runtime.infer(input).await {
                 Ok(result) => result,
                 Err(err) => {
                     log::error!("Inference error: {err}");
