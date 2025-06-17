@@ -1634,9 +1634,8 @@ checksum = "6ee99da9c5ba11bd675621338ef6fa52296b76b83305e9b6e5c77d4c286d6d49"
 
 [[package]]
 name = "web-rwkv"
-version = "0.10.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "176a2876e30d021f9aa03d234703e1fcb14e22092b48df74cc86d692ed343716"
+version = "0.10.13"
+source = "git+https://github.com/cryscan/web-rwkv#1c984b72557c9feadb788ea40dbfac14d479f2e8"
 dependencies = [
  "ahash",
  "bytemuck",
@@ -1669,9 +1668,8 @@ dependencies = [
 
 [[package]]
 name = "web-rwkv-derive"
-version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "23d54675293b70ce12a1abe32f174311d38d31503912fa373f4003ca94c34096"
+version = "0.10.13"
+source = "git+https://github.com/cryscan/web-rwkv#1c984b72557c9feadb788ea40dbfac14d479f2e8"
 dependencies = [
  "proc-macro2",
  "quote",
