@@ -111,6 +111,7 @@ fn load_runtime(
     rescale: Option<usize>,
     extended: bool,
     fp16: bool,
+    batch: usize,
 ) -> Result<WktvRuntime> {
     let tokio = Arc::new(tokio::runtime::Runtime::new()?);
     let _tokio = tokio.clone();
@@ -141,7 +142,7 @@ fn load_runtime(
             ModelVersion::V4 => {
                 if fp16 {
                     let model = builder.build_v4().await?;
-                    let bundle = v4::Bundle::<f16>::new(model, 1);
+                    let bundle = v4::Bundle::<f16>::new(model, batch);
                     let state = Arc::new(bundle.state());
                     let runtime = TokioRuntime::new(bundle).await;
                     WktvRuntime {
@@ -153,7 +154,7 @@ fn load_runtime(
                     }
                 } else {
                     let model = builder.build_v4().await?;
-                    let bundle = v4::Bundle::<f32>::new(model, 1);
+                    let bundle = v4::Bundle::<f32>::new(model, batch);
                     let state = Arc::new(bundle.state());
                     let runtime = TokioRuntime::new(bundle).await;
                     WktvRuntime {
@@ -168,7 +169,7 @@ fn load_runtime(
             ModelVersion::V5 => {
                 if fp16 {
                     let model = builder.build_v5().await?;
-                    let bundle = v5::Bundle::<f16>::new(model, 1);
+                    let bundle = v5::Bundle::<f16>::new(model, batch);
                     let state = Arc::new(bundle.state());
                     let runtime = TokioRuntime::new(bundle).await;
                     WktvRuntime {
@@ -180,7 +181,7 @@ fn load_runtime(
                     }
                 } else {
                     let model = builder.build_v5().await?;
-                    let bundle = v5::Bundle::<f32>::new(model, 1);
+                    let bundle = v5::Bundle::<f32>::new(model, batch);
                     let state = Arc::new(bundle.state());
                     let runtime = TokioRuntime::new(bundle).await;
                     WktvRuntime {
@@ -198,9 +199,9 @@ fn load_runtime(
                     let bundle = match extended {
                         true => {
                             let hooks = make_hooks_extended_v6(&info)?;
-                            v6::Bundle::<f16>::new_with_hooks(model, 1, hooks)
+                            v6::Bundle::<f16>::new_with_hooks(model, batch, hooks)
                         }
-                        false => v6::Bundle::<f16>::new(model, 1),
+                        false => v6::Bundle::<f16>::new(model, batch),
                     };
                     let state = Arc::new(bundle.state());
                     let runtime = TokioRuntime::new(bundle).await;
@@ -216,9 +217,9 @@ fn load_runtime(
                     let bundle = match extended {
                         true => {
                             let hooks = make_hooks_extended_v6(&info)?;
-                            v6::Bundle::<f32>::new_with_hooks(model, 1, hooks)
+                            v6::Bundle::<f32>::new_with_hooks(model, batch, hooks)
                         }
-                        false => v6::Bundle::<f32>::new(model, 1),
+                        false => v6::Bundle::<f32>::new(model, batch),
                     };
                     let state = Arc::new(bundle.state());
                     let runtime = TokioRuntime::new(bundle).await;
@@ -237,9 +238,9 @@ fn load_runtime(
                     let bundle = match extended {
                         true => {
                             let hooks = make_hooks_extended_v7(&info)?;
-                            v7::Bundle::<f16>::new_with_hooks(model, 1, hooks)
+                            v7::Bundle::<f16>::new_with_hooks(model, batch, hooks)
                         }
-                        false => v7::Bundle::<f16>::new(model, 1),
+                        false => v7::Bundle::<f16>::new(model, batch),
                     };
                     let state = Arc::new(bundle.state());
                     let runtime = TokioRuntime::new(bundle).await;
@@ -255,9 +256,9 @@ fn load_runtime(
                     let bundle = match extended {
                         true => {
                             let hooks = make_hooks_extended_v7(&info)?;
-                            v7::Bundle::<f32>::new_with_hooks(model, 1, hooks)
+                            v7::Bundle::<f32>::new_with_hooks(model, batch, hooks)
                         }
-                        false => v7::Bundle::<f32>::new(model, 1),
+                        false => v7::Bundle::<f32>::new(model, batch),
                     };
                     let state = Arc::new(bundle.state());
                     let runtime = TokioRuntime::new(bundle).await;
@@ -275,7 +276,7 @@ fn load_runtime(
     })
 }
 
-fn load_runtime_prefab(model: impl AsRef<Path>, fp16: bool) -> Result<WktvRuntime> {
+fn load_runtime_prefab(model: impl AsRef<Path>, fp16: bool, batch: usize) -> Result<WktvRuntime> {
 
     let tokio = Arc::new(tokio::runtime::Runtime::new()?);
     let _tokio = tokio.clone();
@@ -297,7 +298,7 @@ fn load_runtime_prefab(model: impl AsRef<Path>, fp16: bool) -> Result<WktvRuntim
                 if fp16 {
                     let seed: Seed<_, v4::Model> = Seed::new(&context);
                     let model = seed.deserialize(&mut deserializer)?;
-                    let bundle = v4::Bundle::<f16>::new(model, 1);
+                    let bundle = v4::Bundle::<f16>::new(model, batch);
                     let state = Arc::new(bundle.state());
                     let runtime = TokioRuntime::new(bundle).await;
 
@@ -311,7 +312,7 @@ fn load_runtime_prefab(model: impl AsRef<Path>, fp16: bool) -> Result<WktvRuntim
                 } else {
                     let seed: Seed<_, v4::Model> = Seed::new(&context);
                     let model = seed.deserialize(&mut deserializer)?;
-                    let bundle = v4::Bundle::<f32>::new(model, 1);
+                    let bundle = v4::Bundle::<f32>::new(model, batch);
                     let state = Arc::new(bundle.state());
                     let runtime = TokioRuntime::new(bundle).await;
 
@@ -328,7 +329,7 @@ fn load_runtime_prefab(model: impl AsRef<Path>, fp16: bool) -> Result<WktvRuntim
                 if fp16 {
                     let seed: Seed<_, v5::Model> = Seed::new(&context);
                     let model = seed.deserialize(&mut deserializer)?;
-                    let bundle = v5::Bundle::<f16>::new(model, 1);
+                    let bundle = v5::Bundle::<f16>::new(model, batch);
                     let state = Arc::new(bundle.state());
                     let runtime = TokioRuntime::new(bundle).await;
 
@@ -342,7 +343,7 @@ fn load_runtime_prefab(model: impl AsRef<Path>, fp16: bool) -> Result<WktvRuntim
                 } else {
                     let seed: Seed<_, v5::Model> = Seed::new(&context);
                     let model = seed.deserialize(&mut deserializer)?;
-                    let bundle = v5::Bundle::<f32>::new(model, 1);
+                    let bundle = v5::Bundle::<f32>::new(model, batch);
                     let state = Arc::new(bundle.state());
                     let runtime = TokioRuntime::new(bundle).await;
 
@@ -359,7 +360,7 @@ fn load_runtime_prefab(model: impl AsRef<Path>, fp16: bool) -> Result<WktvRuntim
                 if fp16 {
                     let seed: Seed<_, v6::Model> = Seed::new(&context);
                     let model = seed.deserialize(&mut deserializer)?;
-                    let bundle = v6::Bundle::<f16>::new(model, 1);
+                    let bundle = v6::Bundle::<f16>::new(model, batch);
                     let state = Arc::new(bundle.state());
                     let runtime = TokioRuntime::new(bundle).await;
 
@@ -373,7 +374,7 @@ fn load_runtime_prefab(model: impl AsRef<Path>, fp16: bool) -> Result<WktvRuntim
                 } else {
                     let seed: Seed<_, v6::Model> = Seed::new(&context);
                     let model = seed.deserialize(&mut deserializer)?;
-                    let bundle = v6::Bundle::<f32>::new(model, 1);
+                    let bundle = v6::Bundle::<f32>::new(model, batch);
                     let state = Arc::new(bundle.state());
                     let runtime = TokioRuntime::new(bundle).await;
 
@@ -390,7 +391,7 @@ fn load_runtime_prefab(model: impl AsRef<Path>, fp16: bool) -> Result<WktvRuntim
                 if fp16 {
                     let seed: Seed<_, v7::Model> = Seed::new(&context);
                     let model = seed.deserialize(&mut deserializer)?;
-                    let bundle = v7::Bundle::<f16>::new(model, 1);
+                    let bundle = v7::Bundle::<f16>::new(model, batch);
                     let state = Arc::new(bundle.state());
                     let runtime = TokioRuntime::new(bundle).await;
 
@@ -404,7 +405,7 @@ fn load_runtime_prefab(model: impl AsRef<Path>, fp16: bool) -> Result<WktvRuntim
                 } else {
                     let seed: Seed<_, v7::Model> = Seed::new(&context);
                     let model = seed.deserialize(&mut deserializer)?;
-                    let bundle = v7::Bundle::<f32>::new(model, 1);
+                    let bundle = v7::Bundle::<f32>::new(model, batch);
                     let state = Arc::new(bundle.state());
                     let runtime = TokioRuntime::new(bundle).await;
 
@@ -445,9 +446,9 @@ pub extern "C" fn seed(seed: u64) {
 ///
 /// The caller must ensure that `model` is valid.
 #[no_mangle]
-pub unsafe extern "C" fn load(model: *const c_char, quant: usize, quant_nf4: usize, quant_sf4: usize, fp16: bool) {
+pub unsafe extern "C" fn load(model: *const c_char, quant: usize, quant_nf4: usize, quant_sf4: usize, fp16: bool, batch: usize) {
     let model = unsafe { CStr::from_ptr(model).to_string_lossy().to_string() };
-    match load_runtime(model, quant, quant_nf4, quant_sf4,None, false, fp16) {
+    match load_runtime(model, quant, quant_nf4, quant_sf4,None, false, fp16, batch) {
         Ok(runtime) => {
             let mut rt = RUNTIME.write().unwrap();
             rt.replace(runtime);
@@ -480,9 +481,9 @@ pub unsafe extern "C" fn release() {
 /// 
 /// The caller must ensure that `model` is valid.
 #[no_mangle]
-pub unsafe extern "C" fn load_prefab(model: *const c_char, fp16: bool) {
+pub unsafe extern "C" fn load_prefab(model: *const c_char, fp16: bool, batch: usize) {
     let model = unsafe { CStr::from_ptr(model).to_string_lossy().to_string() };
-    match load_runtime_prefab(model, fp16) {
+    match load_runtime_prefab(model, fp16, batch) {
         Ok(runtime) => {
             let mut rt = RUNTIME.write().unwrap();
             rt.replace(runtime);
@@ -504,9 +505,10 @@ pub unsafe extern "C" fn load_with_rescale(
     quant_sf4: usize,
     rescale: usize,
     fp16: bool,
+    batch: usize,
 ) {
     let model = unsafe { CStr::from_ptr(model).to_string_lossy().to_string() };
-    match load_runtime(model, quant, quant_nf4, quant_sf4, Some(rescale), false, fp16) {
+    match load_runtime(model, quant, quant_nf4, quant_sf4, Some(rescale), false, fp16, batch) {
         Ok(runtime) => {
             let mut rt = RUNTIME.write().unwrap();
             rt.replace(runtime);
@@ -527,9 +529,10 @@ pub unsafe extern "C" fn load_extended(
     quant_nf4: usize,
     quant_sf4: usize,
     fp16: bool,
+    batch: usize,
 ) {
     let model = unsafe { CStr::from_ptr(model).to_string_lossy().to_string() };
-    match load_runtime(model, quant, quant_nf4, quant_sf4, None, true, fp16) {
+    match load_runtime(model, quant, quant_nf4, quant_sf4, None, true, fp16, batch) {
         Ok(runtime) => {
             let mut rt = RUNTIME.write().unwrap();
             rt.replace(runtime);
@@ -540,7 +543,7 @@ pub unsafe extern "C" fn load_extended(
 
 /// Clear the model state.
 #[no_mangle]
-pub extern "C" fn clear_state() {
+pub extern "C" fn clear_state(batch: usize) {
     let runtime = {
         let runtime = RUNTIME.read().unwrap();
         let Some(runtime) = runtime.clone() else {
@@ -550,7 +553,7 @@ pub extern "C" fn clear_state() {
         runtime
     };
     let tensor = runtime.state.init();
-    let _ = runtime.state.load(tensor, 0);
+    let _ = runtime.state.load(tensor, batch);
 }
 
 /// Generate the next token prediction given the input tokens and a sampler.
@@ -665,7 +668,7 @@ impl From<Vec<f32>> for StateRaw {
 
 /// Get the model state.
 #[no_mangle]
-pub extern "C" fn get_state() -> StateRaw {
+pub extern "C" fn get_state(batch: usize) -> StateRaw {
     let runtime = {
         let runtime = RUNTIME.read().unwrap();
         let Some(runtime) = runtime.clone() else {
@@ -676,7 +679,7 @@ pub extern "C" fn get_state() -> StateRaw {
     };
     let tokio = runtime.tokio.clone();
     let tensor = tokio.block_on(async move {
-        runtime.state.back(0).await.map_err(|err| log::error!("{err}"))
+        runtime.state.back(batch).await.map_err(|err| log::error!("{err}"))
     }).unwrap();
     tensor.to_vec().into()
 }
@@ -691,7 +694,7 @@ pub extern "C" fn free_state(state: StateRaw) {
 
 /// Set the model state.
 #[no_mangle]
-pub extern "C" fn set_state(data: StateRaw) {
+pub extern "C" fn set_state(data: StateRaw, batch: usize) {
     let runtime = {
         let runtime = RUNTIME.read().unwrap();
         let Some(runtime) = runtime.clone() else {
@@ -705,7 +708,7 @@ pub extern "C" fn set_state(data: StateRaw) {
             let shape = runtime.state.init_shape();
             let state = unsafe { std::slice::from_raw_parts(data.data, data.len) };
             let state: web_rwkv::tensor::Tensor<web_rwkv::tensor::Cpu<f32>, f32> = runtime.context.tensor_from_data(shape, state.to_vec()).unwrap();
-            let _ = runtime.state.load(state, 0);
+            let _ = runtime.state.load(state, batch);
         },
     );
 }
