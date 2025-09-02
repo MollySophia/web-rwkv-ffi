@@ -71,6 +71,8 @@ uint32_t infer(const uint32_t *tokens,
 /// Delete the model output vector created by the infer functions.
 void free_raw(struct ModelOutput output);
 
+void free_raw_batch(struct ModelOutputBatch output);
+
 /// Compute the model's raw output (next token prediction only) given the input tokens.
 ///
 /// # Safety
