@@ -12,6 +12,12 @@ struct ModelOutput {
   float *logits;
 };
 
+struct ModelOutputBatch {
+  uintptr_t batch;
+  uintptr_t len;
+  float *logits;
+};
+
 struct ModelInfoOutput {
   uintptr_t version;
   uintptr_t num_layer;
@@ -72,12 +78,16 @@ void free_raw(struct ModelOutput output);
 /// The caller must ensure that `tokens` is valid and `len` does not exceed the actual length of `tokens`.
 struct ModelOutput infer_raw_last(const uint32_t *tokens, uintptr_t len);
 
+struct ModelOutputBatch infer_raw_last_batch(const uint32_t **tokens, uintptr_t *len, uintptr_t batch);
+
 /// Compute the model's raw output (predictions of all tokens) given the input tokens.
 ///
 /// # Safety
 ///
 /// The caller must ensure that `tokens` is valid and `len` does not exceed the actual length of `tokens`.
 struct ModelOutput infer_raw_all(const uint32_t *tokens, uintptr_t len);
+
+struct ModelOutputBatch infer_raw_all_batch(const uint32_t **tokens, uintptr_t *len, uintptr_t batch);
 
 struct ModelInfoOutput get_model_info();
 

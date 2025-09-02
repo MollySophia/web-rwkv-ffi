@@ -644,6 +644,31 @@ impl From<Vec<f32>> for ModelOutput {
         ModelOutput { data, len }
     }
 }
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModelOutputBatch {
+    pub batch: usize,
+    pub len: usize,
+    pub data: *mut f32,
+}
+
+impl ModelOutputBatch {
+    pub fn empty() -> ModelOutputBatch {
+        ModelOutputBatch { batch: 0, len: 0, data: std::ptr::null_mut() }
+    }
+}
+
+impl From<Vec<Vec<f32>>> for ModelOutputBatch {
+    fn from(value: Vec<Vec<f32>>) -> Self {
+        let batch = value.len();
+        let len = value[0].len();
+        let mut data = std::mem::ManuallyDrop::new(value.into_iter().flat_map(|v| v).collect::<Vec<_>>());
+        let data = data.as_mut_ptr();
+        ModelOutputBatch { batch, len, data }
+    }
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StateRaw {
@@ -721,6 +746,13 @@ pub extern "C" fn free_raw(output: ModelOutput) {
     let _ = unsafe { Box::from_raw(x) };
 }
 
+#[no_mangle]
+pub extern "C" fn free_raw_batch(output: ModelOutputBatch) {
+    let x = unsafe { std::slice::from_raw_parts_mut(output.data, output.len * output.batch) };
+    let x = x.as_mut_ptr();
+    let _ = unsafe { Box::from_raw(x) };
+}
+
 /// Compute the model's raw output (next token prediction only) given the input tokens.
 ///
 /// # Safety
@@ -765,6 +797,64 @@ pub unsafe extern "C" fn infer_raw_last(tokens: *const u32, len: usize) -> Model
 
             if input.batches[0].tokens.is_empty() {
                 break output.to_vec();
+            }
+            inference.replace(input);
+        }
+    });
+
+    output.into()
+}
+
+/// Compute the model's raw output (next token prediction only) given the input tokens.
+///
+/// # Safety
+///
+/// The caller must ensure that `tokens` is valid and `len` and `batch` does not exceed the actual length of `tokens`.
+#[no_mangle]
+pub unsafe extern "C" fn infer_raw_last_batch(tokens: *const *const u32, len: *const usize, batch: usize) -> ModelOutputBatch {
+    let runtime = {
+        let runtime = RUNTIME.read().unwrap();
+        let Some(runtime) = runtime.clone() else {
+            log::error!("runtime not loaded");
+            return ModelOutputBatch::empty();
+        };
+        runtime
+    };
+
+    let per_batch_len = unsafe { std::slice::from_raw_parts(len, batch) };
+    let tokens_ptr = unsafe { std::slice::from_raw_parts(tokens, batch) };
+    let mut tokens_vec = Vec::new();
+    for i in 0..batch {
+        let batch_tokens = unsafe { std::slice::from_raw_parts(tokens_ptr[i], per_batch_len[i]) }.iter().map(|t| Token::Token(*t)).collect();
+        tokens_vec.push(batch_tokens);
+    }
+    if tokens_vec.is_empty() {
+        log::error!("input cannot be empty");
+        return ModelOutputBatch::empty();
+    }
+
+    let tokio = runtime.tokio.clone(); 
+    let output = tokio.block_on(async move {
+        let mut inference = Some(RnnInput::new(
+            tokens_vec
+                .into_iter()
+                .map(|t| RnnInputBatch::new(t, RnnOption::Last))
+                .collect(),
+            128,
+        ));
+        loop {
+            let input = inference.take().unwrap();
+            let (input, output) = match runtime.runtime.infer(input).await {
+                Ok(result) => result,
+                Err(err) => {
+                    log::error!("Inference error: {err}");
+                    break vec![];
+                }
+            };
+
+            if input.batches.iter().all(|batch| batch.tokens.is_empty()) {
+                let output = output.iter().map(|batch| batch.0.clone().to_vec()).collect_vec();
+                break output.into();
             }
             inference.replace(input);
         }
