@@ -446,14 +446,18 @@ pub extern "C" fn seed(seed: u64) {
 ///
 /// The caller must ensure that `model` is valid.
 #[no_mangle]
-pub unsafe extern "C" fn load(model: *const c_char, quant: usize, quant_nf4: usize, quant_sf4: usize, fp16: bool, batch: usize) {
+pub unsafe extern "C" fn load(model: *const c_char, quant: usize, quant_nf4: usize, quant_sf4: usize, fp16: bool, batch: usize) -> i32 {
     let model = unsafe { CStr::from_ptr(model).to_string_lossy().to_string() };
     match load_runtime(model, quant, quant_nf4, quant_sf4,None, false, fp16, batch) {
         Ok(runtime) => {
             let mut rt = RUNTIME.write().unwrap();
             rt.replace(runtime);
+            return 0;
         }
-        Err(err) => log::error!("{err}"),
+        Err(err) => {
+            log::error!("{err}");
+            return -1;
+        }
     }
 }
 
@@ -481,14 +485,18 @@ pub unsafe extern "C" fn release() {
 /// 
 /// The caller must ensure that `model` is valid.
 #[no_mangle]
-pub unsafe extern "C" fn load_prefab(model: *const c_char, fp16: bool, batch: usize) {
+pub unsafe extern "C" fn load_prefab(model: *const c_char, fp16: bool, batch: usize) -> i32 {
     let model = unsafe { CStr::from_ptr(model).to_string_lossy().to_string() };
     match load_runtime_prefab(model, fp16, batch) {
         Ok(runtime) => {
             let mut rt = RUNTIME.write().unwrap();
             rt.replace(runtime);
+            return 0;
         }
-        Err(err) => log::error!("{err}"),
+        Err(err) => {
+            log::error!("{err}");
+            return -1;
+        }
     }
 }
 
@@ -506,14 +514,18 @@ pub unsafe extern "C" fn load_with_rescale(
     rescale: usize,
     fp16: bool,
     batch: usize,
-) {
+) -> i32 {
     let model = unsafe { CStr::from_ptr(model).to_string_lossy().to_string() };
     match load_runtime(model, quant, quant_nf4, quant_sf4, Some(rescale), false, fp16, batch) {
         Ok(runtime) => {
             let mut rt = RUNTIME.write().unwrap();
             rt.replace(runtime);
+            return 0;
         }
-        Err(err) => log::error!("{err}"),
+        Err(err) => {
+            log::error!("{err}");
+            return -1;
+        }
     }
 }
 
@@ -530,14 +542,18 @@ pub unsafe extern "C" fn load_extended(
     quant_sf4: usize,
     fp16: bool,
     batch: usize,
-) {
+) -> i32 {
     let model = unsafe { CStr::from_ptr(model).to_string_lossy().to_string() };
     match load_runtime(model, quant, quant_nf4, quant_sf4, None, true, fp16, batch) {
         Ok(runtime) => {
             let mut rt = RUNTIME.write().unwrap();
             rt.replace(runtime);
+            return 0;
         }
-        Err(err) => log::error!("{err}"),
+        Err(err) => {
+            log::error!("{err}");
+            return -1;
+        }
     }
 }
 

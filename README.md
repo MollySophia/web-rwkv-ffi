@@ -36,14 +36,14 @@ pub struct StateRaw {
 pub fn init(seed: u64);
 /// Set the RNG seed.
 pub fn seed(seed: u64);
-/// Load a runtime.
-pub fn load(model: *const c_char, quant: usize, quant_nf4: usize, quant_sf4: usize, fp16: bool);
-/// Load a prefab model.
-pub fn load_prefab(model: *const c_char, fp16: bool);
-/// Load a model with rescale.
-pub fn load_with_rescale(model: *const c_char, quant: usize, quant_nf4: usize, quant_sf4: usize, rescale: usize, fp16: bool);
-/// Load an extended model (for Othello and other demos).
-pub fn load_extended(model: *const c_char, quant: usize, quant_nf4: usize, quant_sf4: usize, fp16: bool);
+/// Load a runtime. Returns 0 on success, -1 on error.
+pub fn load(model: *const c_char, quant: usize, quant_nf4: usize, quant_sf4: usize, fp16: bool) -> i32;
+/// Load a prefab model. Returns 0 on success, -1 on error.
+pub fn load_prefab(model: *const c_char, fp16: bool) -> i32;
+/// Load a model with rescale. Returns 0 on success, -1 on error.
+pub fn load_with_rescale(model: *const c_char, quant: usize, quant_nf4: usize, quant_sf4: usize, rescale: usize, fp16: bool) -> i32;
+/// Load an extended model (for Othello and other demos). Returns 0 on success, -1 on error.
+pub fn load_extended(model: *const c_char, quant: usize, quant_nf4: usize, quant_sf4: usize, fp16: bool) -> i32;
 /// Clear the model state.
 pub fn clear_state();
 /// Get the model state.
