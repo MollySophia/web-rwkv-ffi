@@ -40,13 +40,13 @@ void seed(uint64_t seed);
 /// # Safety
 ///
 /// The caller must ensure that `model` is valid.
-void load(const char *model, uintptr_t quant, uintptr_t quant_nf4, uintptr_t quant_sf4, bool fp16);
+int load(const char *model, uintptr_t quant, uintptr_t quant_nf4, uintptr_t quant_sf4, bool fp16);
 
-void load_prefab(const char *model, bool fp16);
+int load_prefab(const char *model, bool fp16);
 
-void load_extended(const char *model, uintptr_t quant, uintptr_t quant_nf4, uintptr_t quant_sf4, bool fp16);
+int load_extended(const char *model, uintptr_t quant, uintptr_t quant_nf4, uintptr_t quant_sf4, bool fp16);
 
-void load_with_rescale(const char *model, uintptr_t quant, uintptr_t quant_nf4, uintptr_t quant_sf4, uintptr_t rescale, bool fp16);
+int load_with_rescale(const char *model, uintptr_t quant, uintptr_t quant_nf4, uintptr_t quant_sf4, uintptr_t rescale, bool fp16);
 
 void release();
 
