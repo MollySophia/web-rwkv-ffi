@@ -504,14 +504,14 @@ fn load_tensors<'a, 'b, 'c, 'd>(
             *shape.iter_mut().nth_back(0).unwrap() = num_row;
             *shape.iter_mut().nth_back(1).unwrap() = num_col;
 
-            println!("{name}\t{:?}\t(Transposed)", shape);
+            // println!("{name}\t{:?}\t(Transposed)", shape);
             Tensor {
                 name,
                 shape,
                 data: transposed,
             }
         } else {
-            println!("{name}\t{:?}", shape);
+            // println!("{name}\t{:?}", shape);
             Tensor { name, shape, data }
         }
     })
