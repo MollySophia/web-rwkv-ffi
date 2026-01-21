@@ -8,6 +8,7 @@ crate-type = ["cdylib", "staticlib"]
 
 [dependencies]
 anyhow = "1.0"
+bytemuck = { version = "1.13", features = ["extern_crate_alloc"] }
 cbor4ii = { version = "1.0.0", features = ["serde1"] }
 fastrand = "2.3"
 half = { version = "2.2", features = ["bytemuck", "serde"] }
@@ -19,3 +20,7 @@ serde = { version = "1", features = ["derive"] }
 simple_logger = { version = "5.0.0", features = ["stderr"] }
 tokio = { version = "1.41", features = ["full"] }
 web-rwkv = "0.10.15"
+
+[dependencies.repugnant-pickle]
+git = "https://github.com/MollySophia/repugnant-pickle"
+features = ["torch"]

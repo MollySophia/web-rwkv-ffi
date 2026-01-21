@@ -48,6 +48,8 @@ void seed(uint64_t seed);
 /// The caller must ensure that `model` is valid.
 int load(const char *model, uintptr_t quant, uintptr_t quant_nf4, uintptr_t quant_sf4, bool fp16, uintptr_t batch);
 
+int load_pth(const char *model, uintptr_t quant, uintptr_t quant_nf4, uintptr_t quant_sf4, bool fp16, uintptr_t batch);
+
 int load_prefab(const char *model, bool fp16, uintptr_t batch);
 
 int load_extended(const char *model, uintptr_t quant, uintptr_t quant_nf4, uintptr_t quant_sf4, bool fp16, uintptr_t batch);

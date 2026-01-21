@@ -1,21 +1,23 @@
 use std::{
+    borrow::Cow,
+    collections::HashMap,
     ffi::{c_char, CStr},
     path::Path,
     sync::{Arc, RwLock},
 };
 
 use anyhow::Result;
-use half::f16;
+use half::{f16, bf16};
 use serde::{de::DeserializeSeed, Deserialize};
 use itertools::Itertools;
 use memmap2::Mmap;
-use safetensors::SafeTensors;
+use safetensors::{Dtype, SafeTensors};
 use tokio::fs::File;
 use web_rwkv::{
     context::{Context, ContextBuilder, InstanceExt},
     runtime::{
         infer::{Rnn, RnnInput, RnnInputBatch, RnnOption, Token},
-        loader::Loader,
+        loader::{Loader, Reader},
         model::{
             ContextAutoLimits, ModelBuilder, ModelInfo, ModelVersion, Quant,
             State, Bundle
@@ -28,6 +30,9 @@ use web_rwkv::{
     wgpu,
 };
 use ops::TensorOpExt;
+use repugnant_pickle::{
+    RepugnantTorchTensor as TorchTensor, RepugnantTorchTensors as TorchTensors, TensorType,
+};
 
 mod ops;
 
@@ -423,6 +428,290 @@ fn load_runtime_prefab(model: impl AsRef<Path>, fp16: bool, batch: usize) -> Res
     })
 }
 
+struct Tensor {
+    name: String,
+    shape: Vec<usize>,
+    data: Vec<f16>,
+}
+
+struct TensorMap(HashMap<String, Tensor>);
+
+impl Reader for TensorMap {
+    fn names(&self) -> Vec<&str> {
+        self.0.keys().map(|s| s.as_str()).collect()
+    }
+
+    fn contains(&self, name: &str) -> bool {
+        self.0.contains_key(name)
+    }
+
+    fn shape(&self, name: &str) -> Result<Vec<usize>, safetensors::SafeTensorError> {
+        self.0.get(name)
+            .map(|tensor| tensor.shape.clone())
+            .ok_or(safetensors::SafeTensorError::TensorNotFound(name.to_string()))
+    }
+
+    fn tensor(&self, name: &str) -> Result<(Dtype, Vec<usize>, Cow<'_, [u8]>), safetensors::SafeTensorError> {
+        self.0.get(name)
+            .map(|tensor| {
+                let data_bytes = bytemuck::cast_slice(&tensor.data);
+                (
+                    Dtype::F16,
+                    tensor.shape.clone(),
+                    Cow::Borrowed(data_bytes),
+                )
+            })
+            .ok_or(safetensors::SafeTensorError::TensorNotFound(name.to_string()))
+    }
+}
+
+fn load_tensors<'a, 'b, 'c, 'd>(
+    data: &'a [u8],
+    torch: TorchTensors,
+    rename: impl IntoIterator<Item = (&'b str, &'c str)> + Clone + 'a,
+    transpose: impl IntoIterator<Item = &'d str> + Clone + 'a,
+) -> impl IntoIterator<Item = Tensor> + 'a {
+    torch.into_iter().map(move |tensor: TorchTensor| {
+        let name = rename
+            .clone()
+            .into_iter()
+            .fold(tensor.name, |name, (p, to)| name.replace(p, to));
+        let shape = tensor.shape;
+        let size: usize = shape.iter().product();
+        let bytes = size * tensor.tensor_type.size();
+
+        assert!(matches!(tensor.tensor_type, TensorType::BFloat16));
+        let start = tensor.absolute_offset as usize;
+        let end = start + bytes;
+        let data: &[bf16] = bytemuck::cast_slice(&data[start..end]);
+        let data: Vec<_> = data.iter().map(|x| f16::from_f32(x.to_f32())).collect();
+
+        if transpose.clone().into_iter().any(|p| name.contains(p)) {
+            let mut transposed = vec![f16::ZERO; data.len()];
+            let num_col = *shape.iter().nth_back(0).expect("should be at least 2d");
+            let num_row = *shape.iter().nth_back(1).expect("should be at least 2d");
+            let num_batch = *shape.iter().nth_back(2).unwrap_or(&1);
+            for b in 0..num_batch {
+                for i in 0..num_row {
+                    for j in 0..num_col {
+                        let from = b * num_col * num_row + i * num_col + j;
+                        let to = b * num_col * num_row + j * num_row + i;
+                        transposed[to] = data[from];
+                    }
+                }
+            }
+            let mut shape = shape;
+            *shape.iter_mut().nth_back(0).unwrap() = num_row;
+            *shape.iter_mut().nth_back(1).unwrap() = num_col;
+
+            println!("{name}\t{:?}\t(Transposed)", shape);
+            Tensor {
+                name,
+                shape,
+                data: transposed,
+            }
+        } else {
+            println!("{name}\t{:?}", shape);
+            Tensor { name, shape, data }
+        }
+    })
+}
+
+pub const RENAME: [(&str, &str); 4] = [
+    ("time_faaaa", "time_first"),
+    ("time_maa", "time_mix"),
+    ("lora_A", "lora.0"),
+    ("lora_B", "lora.1"),
+];
+
+pub const TRANSPOSE: [&str; 14] = [
+    "time_mix_w1",
+    "time_mix_w2",
+    "time_decay_w1",
+    "time_decay_w2",
+    "w1", "w2", "a1", "a2", "g1", "g2", "v1", "v2",
+    "time_state",
+    "lora.0",
+];
+
+fn load_runtime_pth(
+    model: impl AsRef<Path>,
+    quant: usize,
+    quant_nf4: usize,
+    quant_sf4: usize,
+    rescale: Option<usize>,
+    extended: bool,
+    fp16: bool,
+    batch: usize,
+) -> Result<WktvRuntime> {
+    let tokio = Arc::new(tokio::runtime::Runtime::new()?);
+    let _tokio = tokio.clone();
+
+    _tokio.block_on(async move {
+        let file = File::open(&model).await?;
+        let data = unsafe { Mmap::map(&file)? };
+        let torch = TorchTensors::new_from_file(&model)?;
+        let tensors = load_tensors(&data, torch, RENAME, TRANSPOSE);
+
+        let model = TensorMap(tensors.into_iter().map(|tensor| {
+            let name = tensor.name.clone();
+            (name, tensor)
+        }).collect());
+        let info = Loader::info(&model)?;
+        log::info!("{:#?}", info);
+
+        let context = create_context(&info).await?;
+        log::info!("{:#?}", context.adapter.get_info());
+
+        let quant = (0..quant)
+            .map(|layer| (layer, Quant::Int8))
+            .chain((0..quant_nf4).map(|layer| (layer, Quant::NF4)))
+            .chain((0..quant_sf4).map(|layer| (layer, Quant::SF4)))
+            .collect();
+
+        let builder = ModelBuilder::new(&context, model).quant(quant);
+        let builder = match rescale {
+            Some(rescale) => builder.rescale(rescale),
+            None => builder,
+        };
+        let runtime = match info.version {
+            ModelVersion::V4 => {
+                if fp16 {
+                    let model = builder.build_v4().await?;
+                    let bundle = v4::Bundle::<f16>::new(model, batch);
+                    let state = Arc::new(bundle.state());
+                    let runtime = TokioRuntime::new(bundle).await;
+                    WktvRuntime {
+                        runtime,
+                        info,
+                        state,
+                        context,
+                        tokio,
+                    }
+                } else {
+                    let model = builder.build_v4().await?;
+                    let bundle = v4::Bundle::<f32>::new(model, batch);
+                    let state = Arc::new(bundle.state());
+                    let runtime = TokioRuntime::new(bundle).await;
+                    WktvRuntime {
+                        runtime,
+                        info,
+                        state,
+                        context,
+                        tokio,
+                    }
+                }
+            }
+            ModelVersion::V5 => {
+                if fp16 {
+                    let model = builder.build_v5().await?;
+                    let bundle = v5::Bundle::<f16>::new(model, batch);
+                    let state = Arc::new(bundle.state());
+                    let runtime = TokioRuntime::new(bundle).await;
+                    WktvRuntime {
+                        runtime,
+                        info,
+                        state,
+                        context,
+                        tokio,
+                    }
+                } else {
+                    let model = builder.build_v5().await?;
+                    let bundle = v5::Bundle::<f32>::new(model, batch);
+                    let state = Arc::new(bundle.state());
+                    let runtime = TokioRuntime::new(bundle).await;
+                    WktvRuntime {
+                        runtime,
+                        info,
+                        state,
+                        context,
+                        tokio,
+                    }
+                }
+            }
+            ModelVersion::V6 => {
+                if fp16 {
+                    let model = builder.build_v6().await?;
+                    let bundle = match extended {
+                        true => {
+                            let hooks = make_hooks_extended_v6(&info)?;
+                            v6::Bundle::<f16>::new_with_hooks(model, batch, hooks)
+                        }
+                        false => v6::Bundle::<f16>::new(model, batch),
+                    };
+                    let state = Arc::new(bundle.state());
+                    let runtime = TokioRuntime::new(bundle).await;
+                    WktvRuntime {
+                        runtime,
+                        info,
+                        state,
+                        context,
+                        tokio,
+                    }
+                } else {
+                    let model = builder.build_v6().await?;
+                    let bundle = match extended {
+                        true => {
+                            let hooks = make_hooks_extended_v6(&info)?;
+                            v6::Bundle::<f32>::new_with_hooks(model, batch, hooks)
+                        }
+                        false => v6::Bundle::<f32>::new(model, batch),
+                    };
+                    let state = Arc::new(bundle.state());
+                    let runtime = TokioRuntime::new(bundle).await;
+                    WktvRuntime {
+                        runtime,
+                        info,
+                        state,
+                        context,
+                        tokio,
+                    }
+                }
+            }
+            ModelVersion::V7 => {
+                if fp16 {
+                    let model = builder.build_v7().await?;
+                    let bundle = match extended {
+                        true => {
+                            let hooks = make_hooks_extended_v7(&info)?;
+                            v7::Bundle::<f16>::new_with_hooks(model, batch, hooks)
+                        }
+                        false => v7::Bundle::<f16>::new(model, batch),
+                    };
+                    let state = Arc::new(bundle.state());
+                    let runtime = TokioRuntime::new(bundle).await;
+                    WktvRuntime {
+                        runtime,
+                        info,
+                        state,
+                        context,
+                        tokio,
+                    }
+                } else {
+                    let model = builder.build_v7().await?;
+                    let bundle = match extended {
+                        true => {
+                            let hooks = make_hooks_extended_v7(&info)?;
+                            v7::Bundle::<f32>::new_with_hooks(model, batch, hooks)
+                        }
+                        false => v7::Bundle::<f32>::new(model, batch),
+                    };
+                    let state = Arc::new(bundle.state());
+                    let runtime = TokioRuntime::new(bundle).await;
+                    WktvRuntime {
+                        runtime,
+                        info,
+                        state,
+                        context,
+                        tokio,
+                    }
+                }
+            }
+        };
+        Ok(runtime)
+    })
+}
+
 /// Initialize logger and RNG. Call this once before everything.
 #[no_mangle]
 pub extern "C" fn init(seed: u64) {
@@ -488,6 +777,27 @@ pub unsafe extern "C" fn release() {
 pub unsafe extern "C" fn load_prefab(model: *const c_char, fp16: bool, batch: usize) -> i32 {
     let model = unsafe { CStr::from_ptr(model).to_string_lossy().to_string() };
     match load_runtime_prefab(model, fp16, batch) {
+        Ok(runtime) => {
+            let mut rt = RUNTIME.write().unwrap();
+            rt.replace(runtime);
+            return 0;
+        }
+        Err(err) => {
+            log::error!("{err}");
+            return -1;
+        }
+    }
+}
+
+/// Load a runtime from pth.
+/// 
+/// # Safety
+/// 
+/// The caller must ensure that `model` is valid.
+#[no_mangle]
+pub unsafe extern "C" fn load_pth(model: *const c_char, quant: usize, quant_nf4: usize, quant_sf4: usize, fp16: bool, batch: usize) -> i32 {
+    let model = unsafe { CStr::from_ptr(model).to_string_lossy().to_string() };
+    match load_runtime_pth(model, quant, quant_nf4, quant_sf4, None, false, fp16, batch) {
         Ok(runtime) => {
             let mut rt = RUNTIME.write().unwrap();
             rt.replace(runtime);
