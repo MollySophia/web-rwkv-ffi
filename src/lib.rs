@@ -33,6 +33,7 @@ use ops::TensorOpExt;
 use repugnant_pickle::{
     RepugnantTorchTensor as TorchTensor, RepugnantTorchTensors as TorchTensors, TensorType,
 };
+use safetensors::View;
 
 mod ops;
 
@@ -465,6 +466,24 @@ impl Reader for TensorMap {
     }
 }
 
+impl View for Tensor {
+    fn dtype(&self) -> Dtype {
+        Dtype::F16
+    }
+
+    fn shape(&self) -> &[usize] {
+        &self.shape
+    }
+
+    fn data(&self) -> Cow<'_, [u8]> {
+        Cow::Borrowed(bytemuck::cast_slice(&self.data))
+    }
+
+    fn data_len(&self) -> usize {
+        self.data.len() * self.dtype().bitsize() / 8usize
+    }
+}
+
 fn load_tensors<'a, 'b, 'c, 'd>(
     data: &'a [u8],
     torch: TorchTensors,
@@ -808,6 +827,47 @@ pub unsafe extern "C" fn load_pth(model: *const c_char, quant: usize, quant_nf4:
             return -1;
         }
     }
+}
+
+pub fn convert_safetensors(
+    input: impl AsRef<Path>,
+    output: impl AsRef<Path>
+) -> Result<()> {
+    let tokio = Arc::new(tokio::runtime::Runtime::new()?);
+    let _tokio = tokio.clone();
+
+    _tokio.block_on(async move {
+        let file = File::open(&input).await?;
+        let data = unsafe { Mmap::map(&file)? };
+        let torch = TorchTensors::new_from_file(&input)?;
+        let tensors = load_tensors(&data, torch, RENAME, TRANSPOSE);
+        let data = tensors.into_iter().map(|tensor| {
+            let name = tensor.name.clone();
+            (name, tensor)
+        });
+        safetensors::serialize_to_file(data, None, output.as_ref())?;
+        Ok(())
+    })
+}
+
+/// Convert a pth file to a st file.
+/// 
+/// # Safety
+/// 
+/// The caller must ensure that `input_path` and `output_path` are valid.
+#[no_mangle]
+pub unsafe extern "C" fn convert_pth_to_st(input_path: *const c_char, output_path: *const c_char) -> i32 {
+    let input_path = unsafe { CStr::from_ptr(input_path).to_string_lossy().to_string() };
+    let output_path = unsafe { CStr::from_ptr(output_path).to_string_lossy().to_string() };
+    
+    let ret = match convert_safetensors(input_path, output_path) {
+        Ok(_) => 0,
+        Err(err) => {
+            log::error!("{err}");
+            -1
+        }
+    };
+    ret
 }
 
 /// Load a runtime with `rescale` layers specified.
