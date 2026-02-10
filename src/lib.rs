@@ -489,8 +489,15 @@ fn load_tensors<'a, 'b, 'c, 'd>(
     torch: TorchTensors,
     rename: impl IntoIterator<Item = (&'b str, &'c str)> + Clone + 'a,
     transpose: impl IntoIterator<Item = &'d str> + Clone + 'a,
-) -> impl IntoIterator<Item = Tensor> + 'a {
-    torch.into_iter().map(move |tensor: TorchTensor| {
+    callback: Option<extern "C" fn(f32)>,
+) -> Vec<Tensor> {
+    let tensors_vec: Vec<_> = torch.0.clone();
+    let total = tensors_vec.len();
+    tensors_vec.into_iter().enumerate().map(move |(index, tensor): (usize, TorchTensor)| {
+        if let Some(cb) = callback {
+            let progress = (index as f32 + 1.0) / total as f32 * 0.5;
+            cb(progress);
+        }
         let name = rename
             .clone()
             .into_iter()
@@ -533,7 +540,7 @@ fn load_tensors<'a, 'b, 'c, 'd>(
             // println!("{name}\t{:?}", shape);
             Tensor { name, shape, data }
         }
-    })
+    }).collect()
 }
 
 pub const RENAME: [(&str, &str); 4] = [
@@ -562,6 +569,7 @@ fn load_runtime_pth(
     extended: bool,
     fp16: bool,
     batch: usize,
+    callback: Option<extern "C" fn(f32)>,
 ) -> Result<WktvRuntime> {
     let tokio = Arc::new(tokio::runtime::Runtime::new()?);
     let _tokio = tokio.clone();
@@ -570,12 +578,17 @@ fn load_runtime_pth(
         let file = File::open(&model).await?;
         let data = unsafe { Mmap::map(&file)? };
         let torch = TorchTensors::new_from_file(&model)?;
-        let tensors = load_tensors(&data, torch, RENAME, TRANSPOSE);
+        let tensors = load_tensors(&data, torch, RENAME, TRANSPOSE, callback);
+
+        if let Some(cb) = callback {
+            cb(0.5);
+        }
 
         let model = TensorMap(tensors.into_iter().map(|tensor| {
             let name = tensor.name.clone();
             (name, tensor)
         }).collect());
+
         let info = Loader::info(&model)?;
         log::info!("{:#?}", info);
 
@@ -727,6 +740,9 @@ fn load_runtime_pth(
                 }
             }
         };
+        if let Some(cb) = callback {
+            cb(1.0);
+        }
         Ok(runtime)
     })
 }
@@ -814,9 +830,9 @@ pub unsafe extern "C" fn load_prefab(model: *const c_char, fp16: bool, batch: us
 /// 
 /// The caller must ensure that `model` is valid.
 #[no_mangle]
-pub unsafe extern "C" fn load_pth(model: *const c_char, quant: usize, quant_nf4: usize, quant_sf4: usize, fp16: bool, batch: usize) -> i32 {
+pub unsafe extern "C" fn load_pth(model: *const c_char, quant: usize, quant_nf4: usize, quant_sf4: usize, fp16: bool, batch: usize, callback: Option<extern "C" fn(f32)>) -> i32 {
     let model = unsafe { CStr::from_ptr(model).to_string_lossy().to_string() };
-    match load_runtime_pth(model, quant, quant_nf4, quant_sf4, None, false, fp16, batch) {
+    match load_runtime_pth(model, quant, quant_nf4, quant_sf4, None, false, fp16, batch, callback) {
         Ok(runtime) => {
             let mut rt = RUNTIME.write().unwrap();
             rt.replace(runtime);
@@ -840,7 +856,7 @@ pub fn convert_safetensors(
         let file = File::open(&input).await?;
         let data = unsafe { Mmap::map(&file)? };
         let torch = TorchTensors::new_from_file(&input)?;
-        let tensors = load_tensors(&data, torch, RENAME, TRANSPOSE);
+        let tensors = load_tensors(&data, torch, RENAME, TRANSPOSE, None);
         let data = tensors.into_iter().map(|tensor| {
             let name = tensor.name.clone();
             (name, tensor)
