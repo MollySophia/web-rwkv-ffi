@@ -19,6 +19,8 @@ use repugnant_pickle::{RepugnantTorchTensors as TorchTensors, TensorType};
 use safetensors::View;
 use safetensors::{Dtype, SafeTensors};
 use serde::{de::DeserializeSeed, Deserialize};
+#[cfg(windows)]
+use std::ffi::c_void;
 use tokio::fs::File;
 use web_rwkv::{
     context::{Context, ContextBuilder, InstanceExt},
@@ -98,6 +100,28 @@ async fn create_context(info: &ModelInfo) -> Result<Context> {
         .build()
         .await?;
     Ok(context)
+}
+
+#[cfg(windows)]
+type WinHandle = *mut c_void;
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GetCurrentProcess() -> WinHandle;
+}
+
+#[cfg(windows)]
+#[link(name = "psapi")]
+unsafe extern "system" {
+    fn EmptyWorkingSet(handle: WinHandle) -> i32;
+}
+
+fn trim_process_working_set() {
+    #[cfg(windows)]
+    unsafe {
+        let _ = EmptyWorkingSet(GetCurrentProcess());
+    }
 }
 
 // async fn load_tokenizer(path: impl AsRef<Path>) -> Result<Tokenizer> {
@@ -824,158 +848,161 @@ fn load_runtime_pth(
     let _tokio = tokio.clone();
 
     _tokio.block_on(async move {
-        let model = TorchReader::new(&model, callback)?;
-        let info = Loader::info(&model)?;
-        log::info!("{:#?}", info);
+        let runtime = {
+            let model = TorchReader::new(&model, callback)?;
+            let info = Loader::info(&model)?;
+            log::info!("{:#?}", info);
 
-        let context = create_context(&info).await?;
-        log::info!("{:#?}", context.adapter.get_info());
+            let context = create_context(&info).await?;
+            log::info!("{:#?}", context.adapter.get_info());
 
-        let quant = (0..quant)
-            .map(|layer| (layer, Quant::Int8))
-            .chain((0..quant_nf4).map(|layer| (layer, Quant::NF4)))
-            .chain((0..quant_sf4).map(|layer| (layer, Quant::SF4)))
-            .collect();
+            let quant = (0..quant)
+                .map(|layer| (layer, Quant::Int8))
+                .chain((0..quant_nf4).map(|layer| (layer, Quant::NF4)))
+                .chain((0..quant_sf4).map(|layer| (layer, Quant::SF4)))
+                .collect();
 
-        let builder = ModelBuilder::new(&context, model).quant(quant);
-        let builder = match rescale {
-            Some(rescale) => builder.rescale(rescale),
-            None => builder,
+            let builder = ModelBuilder::new(&context, model).quant(quant);
+            let builder = match rescale {
+                Some(rescale) => builder.rescale(rescale),
+                None => builder,
+            };
+            match info.version {
+                ModelVersion::V4 => {
+                    if fp16 {
+                        let model = builder.build_v4().await?;
+                        let bundle = v4::Bundle::<f16>::new(model, batch);
+                        let state = Arc::new(bundle.state());
+                        let runtime = TokioRuntime::new(bundle).await;
+                        WktvRuntime {
+                            runtime,
+                            info,
+                            state,
+                            context,
+                            tokio,
+                        }
+                    } else {
+                        let model = builder.build_v4().await?;
+                        let bundle = v4::Bundle::<f32>::new(model, batch);
+                        let state = Arc::new(bundle.state());
+                        let runtime = TokioRuntime::new(bundle).await;
+                        WktvRuntime {
+                            runtime,
+                            info,
+                            state,
+                            context,
+                            tokio,
+                        }
+                    }
+                }
+                ModelVersion::V5 => {
+                    if fp16 {
+                        let model = builder.build_v5().await?;
+                        let bundle = v5::Bundle::<f16>::new(model, batch);
+                        let state = Arc::new(bundle.state());
+                        let runtime = TokioRuntime::new(bundle).await;
+                        WktvRuntime {
+                            runtime,
+                            info,
+                            state,
+                            context,
+                            tokio,
+                        }
+                    } else {
+                        let model = builder.build_v5().await?;
+                        let bundle = v5::Bundle::<f32>::new(model, batch);
+                        let state = Arc::new(bundle.state());
+                        let runtime = TokioRuntime::new(bundle).await;
+                        WktvRuntime {
+                            runtime,
+                            info,
+                            state,
+                            context,
+                            tokio,
+                        }
+                    }
+                }
+                ModelVersion::V6 => {
+                    if fp16 {
+                        let model = builder.build_v6().await?;
+                        let bundle = match extended {
+                            true => {
+                                let hooks = make_hooks_extended_v6(&info)?;
+                                v6::Bundle::<f16>::new_with_hooks(model, batch, hooks)
+                            }
+                            false => v6::Bundle::<f16>::new(model, batch),
+                        };
+                        let state = Arc::new(bundle.state());
+                        let runtime = TokioRuntime::new(bundle).await;
+                        WktvRuntime {
+                            runtime,
+                            info,
+                            state,
+                            context,
+                            tokio,
+                        }
+                    } else {
+                        let model = builder.build_v6().await?;
+                        let bundle = match extended {
+                            true => {
+                                let hooks = make_hooks_extended_v6(&info)?;
+                                v6::Bundle::<f32>::new_with_hooks(model, batch, hooks)
+                            }
+                            false => v6::Bundle::<f32>::new(model, batch),
+                        };
+                        let state = Arc::new(bundle.state());
+                        let runtime = TokioRuntime::new(bundle).await;
+                        WktvRuntime {
+                            runtime,
+                            info,
+                            state,
+                            context,
+                            tokio,
+                        }
+                    }
+                }
+                ModelVersion::V7 => {
+                    if fp16 {
+                        let model = builder.build_v7().await?;
+                        let bundle = match extended {
+                            true => {
+                                let hooks = make_hooks_extended_v7(&info)?;
+                                v7::Bundle::<f16>::new_with_hooks(model, batch, hooks)
+                            }
+                            false => v7::Bundle::<f16>::new(model, batch),
+                        };
+                        let state = Arc::new(bundle.state());
+                        let runtime = TokioRuntime::new(bundle).await;
+                        WktvRuntime {
+                            runtime,
+                            info,
+                            state,
+                            context,
+                            tokio,
+                        }
+                    } else {
+                        let model = builder.build_v7().await?;
+                        let bundle = match extended {
+                            true => {
+                                let hooks = make_hooks_extended_v7(&info)?;
+                                v7::Bundle::<f32>::new_with_hooks(model, batch, hooks)
+                            }
+                            false => v7::Bundle::<f32>::new(model, batch),
+                        };
+                        let state = Arc::new(bundle.state());
+                        let runtime = TokioRuntime::new(bundle).await;
+                        WktvRuntime {
+                            runtime,
+                            info,
+                            state,
+                            context,
+                            tokio,
+                        }
+                    }
+                }
+            }
         };
-        let runtime = match info.version {
-            ModelVersion::V4 => {
-                if fp16 {
-                    let model = builder.build_v4().await?;
-                    let bundle = v4::Bundle::<f16>::new(model, batch);
-                    let state = Arc::new(bundle.state());
-                    let runtime = TokioRuntime::new(bundle).await;
-                    WktvRuntime {
-                        runtime,
-                        info,
-                        state,
-                        context,
-                        tokio,
-                    }
-                } else {
-                    let model = builder.build_v4().await?;
-                    let bundle = v4::Bundle::<f32>::new(model, batch);
-                    let state = Arc::new(bundle.state());
-                    let runtime = TokioRuntime::new(bundle).await;
-                    WktvRuntime {
-                        runtime,
-                        info,
-                        state,
-                        context,
-                        tokio,
-                    }
-                }
-            }
-            ModelVersion::V5 => {
-                if fp16 {
-                    let model = builder.build_v5().await?;
-                    let bundle = v5::Bundle::<f16>::new(model, batch);
-                    let state = Arc::new(bundle.state());
-                    let runtime = TokioRuntime::new(bundle).await;
-                    WktvRuntime {
-                        runtime,
-                        info,
-                        state,
-                        context,
-                        tokio,
-                    }
-                } else {
-                    let model = builder.build_v5().await?;
-                    let bundle = v5::Bundle::<f32>::new(model, batch);
-                    let state = Arc::new(bundle.state());
-                    let runtime = TokioRuntime::new(bundle).await;
-                    WktvRuntime {
-                        runtime,
-                        info,
-                        state,
-                        context,
-                        tokio,
-                    }
-                }
-            }
-            ModelVersion::V6 => {
-                if fp16 {
-                    let model = builder.build_v6().await?;
-                    let bundle = match extended {
-                        true => {
-                            let hooks = make_hooks_extended_v6(&info)?;
-                            v6::Bundle::<f16>::new_with_hooks(model, batch, hooks)
-                        }
-                        false => v6::Bundle::<f16>::new(model, batch),
-                    };
-                    let state = Arc::new(bundle.state());
-                    let runtime = TokioRuntime::new(bundle).await;
-                    WktvRuntime {
-                        runtime,
-                        info,
-                        state,
-                        context,
-                        tokio,
-                    }
-                } else {
-                    let model = builder.build_v6().await?;
-                    let bundle = match extended {
-                        true => {
-                            let hooks = make_hooks_extended_v6(&info)?;
-                            v6::Bundle::<f32>::new_with_hooks(model, batch, hooks)
-                        }
-                        false => v6::Bundle::<f32>::new(model, batch),
-                    };
-                    let state = Arc::new(bundle.state());
-                    let runtime = TokioRuntime::new(bundle).await;
-                    WktvRuntime {
-                        runtime,
-                        info,
-                        state,
-                        context,
-                        tokio,
-                    }
-                }
-            }
-            ModelVersion::V7 => {
-                if fp16 {
-                    let model = builder.build_v7().await?;
-                    let bundle = match extended {
-                        true => {
-                            let hooks = make_hooks_extended_v7(&info)?;
-                            v7::Bundle::<f16>::new_with_hooks(model, batch, hooks)
-                        }
-                        false => v7::Bundle::<f16>::new(model, batch),
-                    };
-                    let state = Arc::new(bundle.state());
-                    let runtime = TokioRuntime::new(bundle).await;
-                    WktvRuntime {
-                        runtime,
-                        info,
-                        state,
-                        context,
-                        tokio,
-                    }
-                } else {
-                    let model = builder.build_v7().await?;
-                    let bundle = match extended {
-                        true => {
-                            let hooks = make_hooks_extended_v7(&info)?;
-                            v7::Bundle::<f32>::new_with_hooks(model, batch, hooks)
-                        }
-                        false => v7::Bundle::<f32>::new(model, batch),
-                    };
-                    let state = Arc::new(bundle.state());
-                    let runtime = TokioRuntime::new(bundle).await;
-                    WktvRuntime {
-                        runtime,
-                        info,
-                        state,
-                        context,
-                        tokio,
-                    }
-                }
-            }
-        };
+        trim_process_working_set();
         if let Some(cb) = callback {
             cb(1.0);
         }
