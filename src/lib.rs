@@ -1,39 +1,36 @@
 use std::{
     borrow::Cow,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     ffi::{c_char, CStr},
+    mem::size_of,
+    mem::ManuallyDrop,
     path::Path,
-    sync::{Arc, RwLock},
+    sync::{Arc, Mutex, RwLock},
 };
 
 use anyhow::Result;
-use half::{f16, bf16};
-use serde::{de::DeserializeSeed, Deserialize};
+use half::{bf16, f16};
 use itertools::Itertools;
-use memmap2::Mmap;
+use memmap2::{Mmap, UncheckedAdvice};
+use ops::TensorOpExt;
+use repugnant_pickle::{RepugnantTorchTensors as TorchTensors, TensorType};
+use safetensors::View;
 use safetensors::{Dtype, SafeTensors};
+use serde::{de::DeserializeSeed, Deserialize};
 use tokio::fs::File;
 use web_rwkv::{
     context::{Context, ContextBuilder, InstanceExt},
+    num::Float,
     runtime::{
         infer::{Rnn, RnnInput, RnnInputBatch, RnnOption, Token},
         loader::{Loader, Reader},
-        model::{
-            ContextAutoLimits, ModelBuilder, ModelInfo, ModelVersion, Quant,
-            State, Bundle
-        },
+        model::{Bundle, ContextAutoLimits, ModelBuilder, ModelInfo, ModelVersion, Quant, State},
         softmax::softmax_one,
         v4, v5, v6, v7, TokioRuntime,
     },
-    num::Float,
     tensor::{ops::TensorOp, serialization::Seed},
     wgpu,
 };
-use ops::TensorOpExt;
-use repugnant_pickle::{
-    RepugnantTorchTensor as TorchTensor, RepugnantTorchTensors as TorchTensors, TensorType,
-};
-use safetensors::View;
 
 mod ops;
 
@@ -283,7 +280,6 @@ fn load_runtime(
 }
 
 fn load_runtime_prefab(model: impl AsRef<Path>, fp16: bool, batch: usize) -> Result<WktvRuntime> {
-
     let tokio = Arc::new(tokio::runtime::Runtime::new()?);
     let _tokio = tokio.clone();
 
@@ -429,118 +425,309 @@ fn load_runtime_prefab(model: impl AsRef<Path>, fp16: bool, batch: usize) -> Res
     })
 }
 
-struct Tensor {
-    name: String,
+#[derive(Clone)]
+struct TorchTensorMeta {
+    source_type: TensorType,
+    start: usize,
+    end: usize,
+    source_shape: Vec<usize>,
     shape: Vec<usize>,
-    data: Vec<f16>,
+    transpose: bool,
 }
 
-struct TensorMap(HashMap<String, Tensor>);
+impl TorchTensorMeta {
+    fn data_len(&self) -> usize {
+        self.shape.iter().product::<usize>() * size_of::<f16>()
+    }
 
-impl Reader for TensorMap {
+    fn load<'a>(&self, mmap: &'a Mmap) -> Result<Cow<'a, [u8]>, safetensors::SafeTensorError> {
+        let bytes = mmap
+            .get(self.start..self.end)
+            .ok_or(safetensors::SafeTensorError::TensorInvalidInfo)?;
+        match (&self.source_type, self.transpose) {
+            (TensorType::Float16, false) => Ok(Cow::Borrowed(bytes)),
+            _ => {
+                let data = self.load_f16(bytes)?;
+                self.release_mmap_range(mmap);
+                Ok(Cow::Owned(f16_vec_into_bytes(data)))
+            }
+        }
+    }
+
+    fn load_f16(&self, data: &[u8]) -> Result<Vec<f16>, safetensors::SafeTensorError> {
+        let invalid = || {
+            safetensors::SafeTensorError::InvalidTensorView(
+                Dtype::F16,
+                self.shape.clone(),
+                data.len(),
+            )
+        };
+
+        match self.source_type {
+            TensorType::Float16 => {
+                let src: &[f16] = bytemuck::try_cast_slice(data).map_err(|_| invalid())?;
+                if self.transpose {
+                    transpose_last_two(&self.source_shape, |index| src[index])
+                } else {
+                    Ok(src.to_vec())
+                }
+            }
+            TensorType::BFloat16 => {
+                let src: &[bf16] = bytemuck::try_cast_slice(data).map_err(|_| invalid())?;
+                if self.transpose {
+                    transpose_last_two(&self.source_shape, |index| {
+                        f16::from_f32(src[index].to_f32())
+                    })
+                } else {
+                    Ok(src.iter().map(|x| f16::from_f32(x.to_f32())).collect())
+                }
+            }
+            TensorType::Float32 => {
+                let src: &[f32] = bytemuck::try_cast_slice(data).map_err(|_| invalid())?;
+                if self.transpose {
+                    transpose_last_two(&self.source_shape, |index| f16::from_f32(src[index]))
+                } else {
+                    Ok(src.iter().copied().map(f16::from_f32).collect())
+                }
+            }
+            _ => Err(safetensors::SafeTensorError::TensorInvalidInfo),
+        }
+    }
+
+    fn release_mmap_range(&self, mmap: &Mmap) {
+        #[cfg(unix)]
+        {
+            let _ = unsafe {
+                // The tensor contents have already been copied into owned memory.
+                // Discarding these file-backed pages only affects residency, not data correctness.
+                mmap.unchecked_advise_range(
+                    UncheckedAdvice::DontNeed,
+                    self.start,
+                    self.end.saturating_sub(self.start),
+                )
+            };
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = mmap;
+        }
+    }
+}
+
+struct TorchLoadProgress {
+    callback: extern "C" fn(f32),
+    total: usize,
+    seen: Mutex<HashSet<String>>,
+}
+
+impl TorchLoadProgress {
+    fn report(&self, name: &str) {
+        let mut seen = self
+            .seen
+            .lock()
+            .expect("torch load progress mutex poisoned");
+        if seen.insert(name.to_string()) {
+            let progress = seen.len() as f32 / self.total as f32 * 0.5;
+            (self.callback)(progress);
+        }
+    }
+}
+
+struct TorchReader {
+    data: Arc<Mmap>,
+    order: Vec<String>,
+    tensors: HashMap<String, TorchTensorMeta>,
+    progress: Option<TorchLoadProgress>,
+}
+
+impl TorchReader {
+    fn new(model: impl AsRef<Path>, callback: Option<extern "C" fn(f32)>) -> Result<Self> {
+        let file = std::fs::File::open(model.as_ref())?;
+        let data = Arc::new(unsafe { Mmap::map(&file)? });
+        let torch = TorchTensors::new_from_file(model)?;
+        let total = torch.0.len();
+        let mut order = Vec::with_capacity(total);
+        let mut tensors = HashMap::with_capacity(total);
+
+        for tensor in torch {
+            let name = rename_tensor_name(tensor.name, RENAME);
+            let transpose = needs_transpose(&name, TRANSPOSE);
+            let source_shape = tensor.shape;
+            let shape = output_shape(&source_shape, transpose);
+            let size: usize = source_shape.iter().product();
+            let bytes = size * tensor.tensor_type.size();
+            let start = tensor.absolute_offset as usize;
+            let end = start + bytes;
+
+            let replaced = tensors.insert(
+                name.clone(),
+                TorchTensorMeta {
+                    source_type: tensor.tensor_type,
+                    start,
+                    end,
+                    source_shape,
+                    shape,
+                    transpose,
+                },
+            );
+            anyhow::ensure!(
+                replaced.is_none(),
+                "duplicate tensor name after renaming: {name}"
+            );
+            order.push(name);
+        }
+
+        let progress = callback.map(|callback| TorchLoadProgress {
+            callback,
+            total: total.max(1),
+            seen: Mutex::new(HashSet::with_capacity(total)),
+        });
+
+        Ok(Self {
+            data,
+            order,
+            tensors,
+            progress,
+        })
+    }
+
+    fn views(&self) -> Vec<(String, TorchView)> {
+        self.order
+            .iter()
+            .map(|name| {
+                let tensor = self
+                    .tensors
+                    .get(name)
+                    .expect("tensor metadata should exist")
+                    .clone();
+                let view = TorchView {
+                    data: self.data.clone(),
+                    tensor,
+                };
+                (name.clone(), view)
+            })
+            .collect()
+    }
+}
+
+impl Reader for TorchReader {
     fn names(&self) -> Vec<&str> {
-        self.0.keys().map(|s| s.as_str()).collect()
+        self.order.iter().map(|name| name.as_str()).collect()
     }
 
     fn contains(&self, name: &str) -> bool {
-        self.0.contains_key(name)
+        self.tensors.contains_key(name)
     }
 
     fn shape(&self, name: &str) -> Result<Vec<usize>, safetensors::SafeTensorError> {
-        self.0.get(name)
+        self.tensors
+            .get(name)
             .map(|tensor| tensor.shape.clone())
-            .ok_or(safetensors::SafeTensorError::TensorNotFound(name.to_string()))
+            .ok_or(safetensors::SafeTensorError::TensorNotFound(
+                name.to_string(),
+            ))
     }
 
-    fn tensor(&self, name: &str) -> Result<(Dtype, Vec<usize>, Cow<'_, [u8]>), safetensors::SafeTensorError> {
-        self.0.get(name)
-            .map(|tensor| {
-                let data_bytes = bytemuck::cast_slice(&tensor.data);
-                (
-                    Dtype::F16,
-                    tensor.shape.clone(),
-                    Cow::Borrowed(data_bytes),
-                )
-            })
-            .ok_or(safetensors::SafeTensorError::TensorNotFound(name.to_string()))
+    fn tensor(
+        &self,
+        name: &str,
+    ) -> Result<(Dtype, Vec<usize>, Cow<'_, [u8]>), safetensors::SafeTensorError> {
+        let tensor = self
+            .tensors
+            .get(name)
+            .ok_or(safetensors::SafeTensorError::TensorNotFound(
+                name.to_string(),
+            ))?;
+        if let Some(progress) = &self.progress {
+            progress.report(name);
+        }
+        Ok((Dtype::F16, tensor.shape.clone(), tensor.load(&self.data)?))
     }
 }
 
-impl View for Tensor {
+struct TorchView {
+    data: Arc<Mmap>,
+    tensor: TorchTensorMeta,
+}
+
+impl View for TorchView {
     fn dtype(&self) -> Dtype {
         Dtype::F16
     }
 
     fn shape(&self) -> &[usize] {
-        &self.shape
+        &self.tensor.shape
     }
 
     fn data(&self) -> Cow<'_, [u8]> {
-        Cow::Borrowed(bytemuck::cast_slice(&self.data))
+        self.tensor
+            .load(&self.data)
+            .expect("torch tensor view should be valid")
     }
 
     fn data_len(&self) -> usize {
-        self.data.len() * self.dtype().bitsize() / 8usize
+        self.tensor.data_len()
     }
 }
 
-fn load_tensors<'a, 'b, 'c, 'd>(
-    data: &'a [u8],
-    torch: TorchTensors,
-    rename: impl IntoIterator<Item = (&'b str, &'c str)> + Clone + 'a,
-    transpose: impl IntoIterator<Item = &'d str> + Clone + 'a,
-    callback: Option<extern "C" fn(f32)>,
-) -> Vec<Tensor> {
-    let tensors_vec: Vec<_> = torch.0.clone();
-    let total = tensors_vec.len();
-    tensors_vec.into_iter().enumerate().map(move |(index, tensor): (usize, TorchTensor)| {
-        if let Some(cb) = callback {
-            let progress = (index as f32 + 1.0) / total as f32 * 0.5;
-            cb(progress);
-        }
-        let name = rename
-            .clone()
-            .into_iter()
-            .fold(tensor.name, |name, (p, to)| name.replace(p, to));
-        let shape = tensor.shape;
-        let size: usize = shape.iter().product();
-        let bytes = size * tensor.tensor_type.size();
+fn rename_tensor_name(
+    name: String,
+    rename: impl IntoIterator<Item = (&'static str, &'static str)>,
+) -> String {
+    rename
+        .into_iter()
+        .fold(name, |name, (from, to)| name.replace(from, to))
+}
 
-        assert!(matches!(tensor.tensor_type, TensorType::BFloat16));
-        let start = tensor.absolute_offset as usize;
-        let end = start + bytes;
-        let data: &[bf16] = bytemuck::cast_slice(&data[start..end]);
-        let data: Vec<_> = data.iter().map(|x| f16::from_f32(x.to_f32())).collect();
+fn needs_transpose(name: &str, transpose: impl IntoIterator<Item = &'static str>) -> bool {
+    transpose.into_iter().any(|pattern| name.contains(pattern))
+}
 
-        if transpose.clone().into_iter().any(|p| name.contains(p)) {
-            let mut transposed = vec![f16::ZERO; data.len()];
-            let num_col = *shape.iter().nth_back(0).expect("should be at least 2d");
-            let num_row = *shape.iter().nth_back(1).expect("should be at least 2d");
-            let num_batch = *shape.iter().nth_back(2).unwrap_or(&1);
-            for b in 0..num_batch {
-                for i in 0..num_row {
-                    for j in 0..num_col {
-                        let from = b * num_col * num_row + i * num_col + j;
-                        let to = b * num_col * num_row + j * num_row + i;
-                        transposed[to] = data[from];
-                    }
-                }
+fn output_shape(shape: &[usize], transpose: bool) -> Vec<usize> {
+    let mut shape = shape.to_vec();
+    if transpose {
+        let len = shape.len();
+        assert!(len >= 2, "transposed tensor should be at least 2d");
+        shape.swap(len - 1, len - 2);
+    }
+    shape
+}
+
+fn transpose_last_two(
+    shape: &[usize],
+    mut value_at: impl FnMut(usize) -> f16,
+) -> Result<Vec<f16>, safetensors::SafeTensorError> {
+    if shape.len() < 2 {
+        return Err(safetensors::SafeTensorError::TensorInvalidInfo);
+    }
+
+    let len = shape.iter().product::<usize>();
+    let num_col = shape[shape.len() - 1];
+    let num_row = shape[shape.len() - 2];
+    let num_batch = shape[..shape.len() - 2].iter().product::<usize>().max(1);
+    let mut transposed = vec![f16::ZERO; len];
+
+    for batch in 0..num_batch {
+        let offset = batch * num_col * num_row;
+        for row in 0..num_row {
+            for col in 0..num_col {
+                let from = offset + row * num_col + col;
+                let to = offset + col * num_row + row;
+                transposed[to] = value_at(from);
             }
-            let mut shape = shape;
-            *shape.iter_mut().nth_back(0).unwrap() = num_row;
-            *shape.iter_mut().nth_back(1).unwrap() = num_col;
-
-            // println!("{name}\t{:?}\t(Transposed)", shape);
-            Tensor {
-                name,
-                shape,
-                data: transposed,
-            }
-        } else {
-            // println!("{name}\t{:?}", shape);
-            Tensor { name, shape, data }
         }
-    }).collect()
+    }
+
+    Ok(transposed)
+}
+
+fn f16_vec_into_bytes(data: Vec<f16>) -> Vec<u8> {
+    let mut data = ManuallyDrop::new(data);
+    let len = data.len() * size_of::<f16>();
+    let cap = data.capacity() * size_of::<f16>();
+    let ptr = data.as_mut_ptr() as *mut u8;
+    unsafe { Vec::from_raw_parts(ptr, len, cap) }
 }
 
 pub const RENAME: [(&str, &str); 4] = [
@@ -555,7 +742,14 @@ pub const TRANSPOSE: [&str; 14] = [
     "time_mix_w2",
     "time_decay_w1",
     "time_decay_w2",
-    "w1", "w2", "a1", "a2", "g1", "g2", "v1", "v2",
+    "w1",
+    "w2",
+    "a1",
+    "a2",
+    "g1",
+    "g2",
+    "v1",
+    "v2",
     "time_state",
     "lora.0",
 ];
@@ -575,20 +769,7 @@ fn load_runtime_pth(
     let _tokio = tokio.clone();
 
     _tokio.block_on(async move {
-        let file = File::open(&model).await?;
-        let data = unsafe { Mmap::map(&file)? };
-        let torch = TorchTensors::new_from_file(&model)?;
-        let tensors = load_tensors(&data, torch, RENAME, TRANSPOSE, callback);
-
-        if let Some(cb) = callback {
-            cb(0.5);
-        }
-
-        let model = TensorMap(tensors.into_iter().map(|tensor| {
-            let name = tensor.name.clone();
-            (name, tensor)
-        }).collect());
-
+        let model = TorchReader::new(&model, callback)?;
         let info = Loader::info(&model)?;
         log::info!("{:#?}", info);
 
@@ -770,9 +951,16 @@ pub extern "C" fn seed(seed: u64) {
 ///
 /// The caller must ensure that `model` is valid.
 #[no_mangle]
-pub unsafe extern "C" fn load(model: *const c_char, quant: usize, quant_nf4: usize, quant_sf4: usize, fp16: bool, batch: usize) -> i32 {
+pub unsafe extern "C" fn load(
+    model: *const c_char,
+    quant: usize,
+    quant_nf4: usize,
+    quant_sf4: usize,
+    fp16: bool,
+    batch: usize,
+) -> i32 {
     let model = unsafe { CStr::from_ptr(model).to_string_lossy().to_string() };
-    match load_runtime(model, quant, quant_nf4, quant_sf4,None, false, fp16, batch) {
+    match load_runtime(model, quant, quant_nf4, quant_sf4, None, false, fp16, batch) {
         Ok(runtime) => {
             let mut rt = RUNTIME.write().unwrap();
             rt.replace(runtime);
@@ -804,9 +992,9 @@ pub unsafe extern "C" fn release() {
 }
 
 /// Load a runtime from prefab.
-/// 
+///
 /// # Safety
-/// 
+///
 /// The caller must ensure that `model` is valid.
 #[no_mangle]
 pub unsafe extern "C" fn load_prefab(model: *const c_char, fp16: bool, batch: usize) -> i32 {
@@ -825,14 +1013,24 @@ pub unsafe extern "C" fn load_prefab(model: *const c_char, fp16: bool, batch: us
 }
 
 /// Load a runtime from pth.
-/// 
+///
 /// # Safety
-/// 
+///
 /// The caller must ensure that `model` is valid.
 #[no_mangle]
-pub unsafe extern "C" fn load_pth(model: *const c_char, quant: usize, quant_nf4: usize, quant_sf4: usize, fp16: bool, batch: usize, callback: Option<extern "C" fn(f32)>) -> i32 {
+pub unsafe extern "C" fn load_pth(
+    model: *const c_char,
+    quant: usize,
+    quant_nf4: usize,
+    quant_sf4: usize,
+    fp16: bool,
+    batch: usize,
+    callback: Option<extern "C" fn(f32)>,
+) -> i32 {
     let model = unsafe { CStr::from_ptr(model).to_string_lossy().to_string() };
-    match load_runtime_pth(model, quant, quant_nf4, quant_sf4, None, false, fp16, batch, callback) {
+    match load_runtime_pth(
+        model, quant, quant_nf4, quant_sf4, None, false, fp16, batch, callback,
+    ) {
         Ok(runtime) => {
             let mut rt = RUNTIME.write().unwrap();
             rt.replace(runtime);
@@ -845,37 +1043,31 @@ pub unsafe extern "C" fn load_pth(model: *const c_char, quant: usize, quant_nf4:
     }
 }
 
-pub fn convert_safetensors(
-    input: impl AsRef<Path>,
-    output: impl AsRef<Path>
-) -> Result<()> {
+pub fn convert_safetensors(input: impl AsRef<Path>, output: impl AsRef<Path>) -> Result<()> {
     let tokio = Arc::new(tokio::runtime::Runtime::new()?);
     let _tokio = tokio.clone();
 
     _tokio.block_on(async move {
-        let file = File::open(&input).await?;
-        let data = unsafe { Mmap::map(&file)? };
-        let torch = TorchTensors::new_from_file(&input)?;
-        let tensors = load_tensors(&data, torch, RENAME, TRANSPOSE, None);
-        let data = tensors.into_iter().map(|tensor| {
-            let name = tensor.name.clone();
-            (name, tensor)
-        });
+        let reader = TorchReader::new(&input, None)?;
+        let data = reader.views();
         safetensors::serialize_to_file(data, None, output.as_ref())?;
         Ok(())
     })
 }
 
 /// Convert a pth file to a st file.
-/// 
+///
 /// # Safety
-/// 
+///
 /// The caller must ensure that `input_path` and `output_path` are valid.
 #[no_mangle]
-pub unsafe extern "C" fn convert_pth_to_st(input_path: *const c_char, output_path: *const c_char) -> i32 {
+pub unsafe extern "C" fn convert_pth_to_st(
+    input_path: *const c_char,
+    output_path: *const c_char,
+) -> i32 {
     let input_path = unsafe { CStr::from_ptr(input_path).to_string_lossy().to_string() };
     let output_path = unsafe { CStr::from_ptr(output_path).to_string_lossy().to_string() };
-    
+
     let ret = match convert_safetensors(input_path, output_path) {
         Ok(_) => 0,
         Err(err) => {
@@ -902,7 +1094,16 @@ pub unsafe extern "C" fn load_with_rescale(
     batch: usize,
 ) -> i32 {
     let model = unsafe { CStr::from_ptr(model).to_string_lossy().to_string() };
-    match load_runtime(model, quant, quant_nf4, quant_sf4, Some(rescale), false, fp16, batch) {
+    match load_runtime(
+        model,
+        quant,
+        quant_nf4,
+        quant_sf4,
+        Some(rescale),
+        false,
+        fp16,
+        batch,
+    ) {
         Ok(runtime) => {
             let mut rt = RUNTIME.write().unwrap();
             rt.replace(runtime);
@@ -974,7 +1175,10 @@ pub unsafe extern "C" fn infer(tokens: *const u32, len: usize, sampler: Sampler)
         runtime
     };
 
-    let tokens: Vec<Token> = unsafe { std::slice::from_raw_parts(tokens, len) }.iter().map(|t| Token::Token(*t)).collect();
+    let tokens: Vec<Token> = unsafe { std::slice::from_raw_parts(tokens, len) }
+        .iter()
+        .map(|t| Token::Token(*t))
+        .collect();
     if tokens.is_empty() {
         log::error!("input cannot be empty");
         return 0;
@@ -1021,7 +1225,6 @@ pub unsafe extern "C" fn infer(tokens: *const u32, len: usize, sampler: Sampler)
                 .unwrap()
                 .0 as u32
         }
-
     })
 }
 
@@ -1057,7 +1260,11 @@ pub struct ModelOutputBatch {
 
 impl ModelOutputBatch {
     pub fn empty() -> ModelOutputBatch {
-        ModelOutputBatch { batch: 0, len: 0, data: std::ptr::null_mut() }
+        ModelOutputBatch {
+            batch: 0,
+            len: 0,
+            data: std::ptr::null_mut(),
+        }
     }
 }
 
@@ -1065,7 +1272,8 @@ impl From<Vec<Vec<f32>>> for ModelOutputBatch {
     fn from(value: Vec<Vec<f32>>) -> Self {
         let batch = value.len();
         let len = value[0].len();
-        let mut data = std::mem::ManuallyDrop::new(value.into_iter().flat_map(|v| v).collect::<Vec<_>>());
+        let mut data =
+            std::mem::ManuallyDrop::new(value.into_iter().flat_map(|v| v).collect::<Vec<_>>());
         let data = data.as_mut_ptr();
         ModelOutputBatch { batch, len, data }
     }
@@ -1105,9 +1313,15 @@ pub extern "C" fn get_state(batch: usize) -> StateRaw {
         runtime
     };
     let tokio = runtime.tokio.clone();
-    let tensor = tokio.block_on(async move {
-        runtime.state.back(batch).await.map_err(|err| log::error!("{err}"))
-    }).unwrap();
+    let tensor = tokio
+        .block_on(async move {
+            runtime
+                .state
+                .back(batch)
+                .await
+                .map_err(|err| log::error!("{err}"))
+        })
+        .unwrap();
     tensor.to_vec().into()
 }
 
@@ -1132,12 +1346,14 @@ pub extern "C" fn set_state(data: StateRaw, batch: usize) {
     };
     let tokio = runtime.tokio.clone();
     tokio.block_on(async move {
-            let shape = runtime.state.init_shape();
-            let state = unsafe { std::slice::from_raw_parts(data.data, data.len) };
-            let state: web_rwkv::tensor::Tensor<web_rwkv::tensor::Cpu<f32>, f32> = runtime.context.tensor_from_data(shape, state.to_vec()).unwrap();
-            let _ = runtime.state.load(state, batch);
-        },
-    );
+        let shape = runtime.state.init_shape();
+        let state = unsafe { std::slice::from_raw_parts(data.data, data.len) };
+        let state: web_rwkv::tensor::Tensor<web_rwkv::tensor::Cpu<f32>, f32> = runtime
+            .context
+            .tensor_from_data(shape, state.to_vec())
+            .unwrap();
+        let _ = runtime.state.load(state, batch);
+    });
 }
 
 /// Delete the model output vector created by the infer functions.
@@ -1171,7 +1387,10 @@ pub unsafe extern "C" fn infer_raw_last(tokens: *const u32, len: usize) -> Model
         runtime
     };
 
-    let tokens: Vec<Token> = unsafe { std::slice::from_raw_parts(tokens, len) }.iter().map(|t| Token::Token(*t)).collect();
+    let tokens: Vec<Token> = unsafe { std::slice::from_raw_parts(tokens, len) }
+        .iter()
+        .map(|t| Token::Token(*t))
+        .collect();
     if tokens.is_empty() {
         log::error!("input cannot be empty");
         return ModelOutput::empty();
@@ -1213,7 +1432,11 @@ pub unsafe extern "C" fn infer_raw_last(tokens: *const u32, len: usize) -> Model
 ///
 /// The caller must ensure that `tokens` is valid and `len` and `batch` does not exceed the actual length of `tokens`.
 #[no_mangle]
-pub unsafe extern "C" fn infer_raw_last_batch(tokens: *const *const u32, len: *const usize, batch: usize) -> ModelOutputBatch {
+pub unsafe extern "C" fn infer_raw_last_batch(
+    tokens: *const *const u32,
+    len: *const usize,
+    batch: usize,
+) -> ModelOutputBatch {
     let runtime = {
         let runtime = RUNTIME.read().unwrap();
         let Some(runtime) = runtime.clone() else {
@@ -1227,7 +1450,10 @@ pub unsafe extern "C" fn infer_raw_last_batch(tokens: *const *const u32, len: *c
     let tokens_ptr = unsafe { std::slice::from_raw_parts(tokens, batch) };
     let mut tokens_vec = Vec::new();
     for i in 0..batch {
-        let batch_tokens = unsafe { std::slice::from_raw_parts(tokens_ptr[i], per_batch_len[i]) }.iter().map(|t| Token::Token(*t)).collect();
+        let batch_tokens = unsafe { std::slice::from_raw_parts(tokens_ptr[i], per_batch_len[i]) }
+            .iter()
+            .map(|t| Token::Token(*t))
+            .collect();
         tokens_vec.push(batch_tokens);
     }
     if tokens_vec.is_empty() {
@@ -1235,7 +1461,7 @@ pub unsafe extern "C" fn infer_raw_last_batch(tokens: *const *const u32, len: *c
         return ModelOutputBatch::empty();
     }
 
-    let tokio = runtime.tokio.clone(); 
+    let tokio = runtime.tokio.clone();
     let output = tokio.block_on(async move {
         let mut inference = Some(RnnInput::new(
             tokens_vec
@@ -1255,7 +1481,10 @@ pub unsafe extern "C" fn infer_raw_last_batch(tokens: *const *const u32, len: *c
             };
 
             if input.batches.iter().all(|batch| batch.tokens.is_empty()) {
-                let output = output.iter().map(|batch| batch.0.clone().to_vec()).collect_vec();
+                let output = output
+                    .iter()
+                    .map(|batch| batch.0.clone().to_vec())
+                    .collect_vec();
                 break output.into();
             }
             inference.replace(input);
@@ -1281,7 +1510,10 @@ pub unsafe extern "C" fn infer_raw_full(tokens: *const u32, len: usize) -> Model
         runtime
     };
 
-    let tokens: Vec<Token> = unsafe { std::slice::from_raw_parts(tokens, len) }.iter().map(|t| Token::Token(*t)).collect();
+    let tokens: Vec<Token> = unsafe { std::slice::from_raw_parts(tokens, len) }
+        .iter()
+        .map(|t| Token::Token(*t))
+        .collect();
     if tokens.is_empty() {
         log::error!("input cannot be empty");
         return ModelOutput::empty();
