@@ -11,7 +11,9 @@ use std::{
 use anyhow::Result;
 use half::{bf16, f16};
 use itertools::Itertools;
-use memmap2::{Mmap, UncheckedAdvice};
+use memmap2::Mmap;
+#[cfg(unix)]
+use memmap2::UncheckedAdvice;
 use ops::TensorOpExt;
 use repugnant_pickle::{RepugnantTorchTensors as TorchTensors, TensorType};
 use safetensors::View;
