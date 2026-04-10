@@ -437,20 +437,90 @@ struct TorchTensorMeta {
     transpose: bool,
 }
 
+#[derive(Clone)]
+enum TorchStorage {
+    #[cfg(unix)]
+    Mmap(Arc<Mmap>),
+    #[cfg(not(unix))]
+    File(Arc<std::fs::File>),
+}
+
+impl TorchStorage {
+    fn new(model: impl AsRef<Path>) -> Result<Self> {
+        let file = Arc::new(std::fs::File::open(model.as_ref())?);
+        #[cfg(unix)]
+        {
+            let mmap = Arc::new(unsafe { Mmap::map(file.as_ref())? });
+            Ok(Self::Mmap(mmap))
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(Self::File(file))
+        }
+    }
+
+    fn read<'a>(
+        &'a self,
+        start: usize,
+        end: usize,
+    ) -> Result<Cow<'a, [u8]>, safetensors::SafeTensorError> {
+        match self {
+            #[cfg(unix)]
+            Self::Mmap(mmap) => mmap
+                .get(start..end)
+                .map(Cow::Borrowed)
+                .ok_or(safetensors::SafeTensorError::TensorInvalidInfo),
+            #[cfg(not(unix))]
+            Self::File(file) => {
+                let len = end
+                    .checked_sub(start)
+                    .ok_or(safetensors::SafeTensorError::TensorInvalidInfo)?;
+                let mmap = unsafe {
+                    memmap2::MmapOptions::new()
+                        .offset(start as u64)
+                        .len(len)
+                        .map(file.as_ref())?
+                };
+                Ok(Cow::Owned(mmap[..].to_vec()))
+            }
+        }
+    }
+
+    fn release(&self, start: usize, end: usize) {
+        #[cfg(unix)]
+        {
+            let Self::Mmap(mmap) = self;
+            let _ = unsafe {
+                mmap.unchecked_advise_range(
+                    UncheckedAdvice::DontNeed,
+                    start,
+                    end.saturating_sub(start),
+                )
+            };
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = (start, end);
+        }
+    }
+}
+
 impl TorchTensorMeta {
     fn data_len(&self) -> usize {
         self.shape.iter().product::<usize>() * size_of::<f16>()
     }
 
-    fn load<'a>(&self, mmap: &'a Mmap) -> Result<Cow<'a, [u8]>, safetensors::SafeTensorError> {
-        let bytes = mmap
-            .get(self.start..self.end)
-            .ok_or(safetensors::SafeTensorError::TensorInvalidInfo)?;
-        match (&self.source_type, self.transpose) {
-            (TensorType::Float16, false) => Ok(Cow::Borrowed(bytes)),
-            _ => {
-                let data = self.load_f16(bytes)?;
-                self.release_mmap_range(mmap);
+    fn load<'a>(
+        &self,
+        storage: &'a TorchStorage,
+    ) -> Result<Cow<'a, [u8]>, safetensors::SafeTensorError> {
+        let bytes = storage.read(self.start, self.end)?;
+        match (&self.source_type, self.transpose, bytes) {
+            (TensorType::Float16, false, bytes) => Ok(bytes),
+            (_, _, bytes) => {
+                let data = self.load_f16(bytes.as_ref())?;
+                storage.release(self.start, self.end);
                 Ok(Cow::Owned(f16_vec_into_bytes(data)))
             }
         }
@@ -495,26 +565,6 @@ impl TorchTensorMeta {
             _ => Err(safetensors::SafeTensorError::TensorInvalidInfo),
         }
     }
-
-    fn release_mmap_range(&self, mmap: &Mmap) {
-        #[cfg(unix)]
-        {
-            let _ = unsafe {
-                // The tensor contents have already been copied into owned memory.
-                // Discarding these file-backed pages only affects residency, not data correctness.
-                mmap.unchecked_advise_range(
-                    UncheckedAdvice::DontNeed,
-                    self.start,
-                    self.end.saturating_sub(self.start),
-                )
-            };
-        }
-
-        #[cfg(not(unix))]
-        {
-            let _ = mmap;
-        }
-    }
 }
 
 struct TorchLoadProgress {
@@ -537,7 +587,7 @@ impl TorchLoadProgress {
 }
 
 struct TorchReader {
-    data: Arc<Mmap>,
+    storage: Arc<TorchStorage>,
     order: Vec<String>,
     tensors: HashMap<String, TorchTensorMeta>,
     progress: Option<TorchLoadProgress>,
@@ -545,8 +595,7 @@ struct TorchReader {
 
 impl TorchReader {
     fn new(model: impl AsRef<Path>, callback: Option<extern "C" fn(f32)>) -> Result<Self> {
-        let file = std::fs::File::open(model.as_ref())?;
-        let data = Arc::new(unsafe { Mmap::map(&file)? });
+        let storage = Arc::new(TorchStorage::new(model.as_ref())?);
         let torch = TorchTensors::new_from_file(model)?;
         let total = torch.0.len();
         let mut order = Vec::with_capacity(total);
@@ -587,7 +636,7 @@ impl TorchReader {
         });
 
         Ok(Self {
-            data,
+            storage,
             order,
             tensors,
             progress,
@@ -604,7 +653,7 @@ impl TorchReader {
                     .expect("tensor metadata should exist")
                     .clone();
                 let view = TorchView {
-                    data: self.data.clone(),
+                    storage: self.storage.clone(),
                     tensor,
                 };
                 (name.clone(), view)
@@ -644,12 +693,16 @@ impl Reader for TorchReader {
         if let Some(progress) = &self.progress {
             progress.report(name);
         }
-        Ok((Dtype::F16, tensor.shape.clone(), tensor.load(&self.data)?))
+        Ok((
+            Dtype::F16,
+            tensor.shape.clone(),
+            tensor.load(&self.storage)?,
+        ))
     }
 }
 
 struct TorchView {
-    data: Arc<Mmap>,
+    storage: Arc<TorchStorage>,
     tensor: TorchTensorMeta,
 }
 
@@ -664,7 +717,7 @@ impl View for TorchView {
 
     fn data(&self) -> Cow<'_, [u8]> {
         self.tensor
-            .load(&self.data)
+            .load(&self.storage)
             .expect("torch tensor view should be valid")
     }
 
