@@ -109,18 +109,13 @@ type WinHandle = *mut c_void;
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn GetCurrentProcess() -> WinHandle;
-}
-
-#[cfg(windows)]
-#[link(name = "psapi")]
-unsafe extern "system" {
-    fn EmptyWorkingSet(handle: WinHandle) -> i32;
+    fn K32EmptyWorkingSet(handle: WinHandle) -> i32;
 }
 
 fn trim_process_working_set() {
     #[cfg(windows)]
     unsafe {
-        let _ = EmptyWorkingSet(GetCurrentProcess());
+        let _ = K32EmptyWorkingSet(GetCurrentProcess());
     }
 }
 
