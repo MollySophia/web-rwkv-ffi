@@ -4,17 +4,23 @@ use std::{
     ffi::{c_char, CStr},
     mem::size_of,
     mem::ManuallyDrop,
+    mem::MaybeUninit,
     path::Path,
-    sync::{Arc, Mutex, RwLock},
+    sync::{Arc, Mutex, OnceLock, RwLock},
+    time::Duration,
 };
 
 use anyhow::Result;
-use half::{bf16, f16};
+use half::{bf16, f16, slice::HalfFloatSliceExt};
 use itertools::Itertools;
 use memmap2::Mmap;
 #[cfg(unix)]
 use memmap2::UncheckedAdvice;
 use ops::TensorOpExt;
+use rayon::{
+    prelude::{IndexedParallelIterator, ParallelIterator, ParallelSlice, ParallelSliceMut},
+    ThreadPool, ThreadPoolBuilder,
+};
 use repugnant_pickle::{RepugnantTorchTensors as TorchTensors, TensorType};
 use safetensors::View;
 use safetensors::{Dtype, SafeTensors};
@@ -36,9 +42,15 @@ use web_rwkv::{
     wgpu,
 };
 
+#[cfg(target_arch = "x86")]
+use std::arch::x86::*;
+#[cfg(target_arch = "x86_64")]
+use std::arch::x86_64::*;
+
 mod ops;
 
 static RUNTIME: RwLock<Option<WktvRuntime>> = RwLock::new(None);
+static CONVERT_THREAD_POOL: OnceLock<ThreadPool> = OnceLock::new();
 
 #[derive(Clone)]
 struct WktvRuntime {
@@ -570,7 +582,7 @@ impl TorchTensorMeta {
                         f16::from_f32(src[index].to_f32())
                     })
                 } else {
-                    Ok(src.iter().map(|x| f16::from_f32(x.to_f32())).collect())
+                    Ok(parallel_convert_bf16_to_f16(src))
                 }
             }
             TensorType::Float32 => {
@@ -578,7 +590,7 @@ impl TorchTensorMeta {
                 if self.transpose {
                     transpose_last_two(&self.source_shape, |index| f16::from_f32(src[index]))
                 } else {
-                    Ok(src.iter().copied().map(f16::from_f32).collect())
+                    Ok(parallel_convert_f32_to_f16(src))
                 }
             }
             _ => Err(safetensors::SafeTensorError::TensorInvalidInfo),
@@ -605,15 +617,41 @@ impl TorchLoadProgress {
     }
 }
 
+#[derive(Default)]
+struct TorchTensorStats {
+    calls: usize,
+    bytes: usize,
+    direct_calls: usize,
+    direct_bytes: usize,
+    convert_calls: usize,
+    convert_bytes: usize,
+    convert_f32_calls: usize,
+    convert_f32_bytes: usize,
+    convert_bf16_calls: usize,
+    convert_bf16_bytes: usize,
+    transpose_calls: usize,
+    transpose_bytes: usize,
+    elapsed: Duration,
+}
+
 struct TorchReader {
     storage: Arc<TorchStorage>,
     order: Vec<String>,
     tensors: HashMap<String, TorchTensorMeta>,
     progress: Option<TorchLoadProgress>,
+    stats: Option<Arc<Mutex<TorchTensorStats>>>,
 }
 
 impl TorchReader {
     fn new(model: impl AsRef<Path>, callback: Option<extern "C" fn(f32)>) -> Result<Self> {
+        Self::new_with_stats(model, callback, None)
+    }
+
+    fn new_with_stats(
+        model: impl AsRef<Path>,
+        callback: Option<extern "C" fn(f32)>,
+        stats: Option<Arc<Mutex<TorchTensorStats>>>,
+    ) -> Result<Self> {
         let storage = Arc::new(TorchStorage::new(model.as_ref())?);
         let torch = TorchTensors::new_from_file(model)?;
         let total = torch.0.len();
@@ -659,6 +697,7 @@ impl TorchReader {
             order,
             tensors,
             progress,
+            stats,
         })
     }
 
@@ -703,6 +742,7 @@ impl Reader for TorchReader {
         &self,
         name: &str,
     ) -> Result<(Dtype, Vec<usize>, Cow<'_, [u8]>), safetensors::SafeTensorError> {
+        let start = std::time::Instant::now();
         let tensor = self
             .tensors
             .get(name)
@@ -712,11 +752,39 @@ impl Reader for TorchReader {
         if let Some(progress) = &self.progress {
             progress.report(name);
         }
-        Ok((
-            Dtype::F16,
-            tensor.shape.clone(),
-            tensor.load(&self.storage)?,
-        ))
+        let data = tensor.load(&self.storage)?;
+        if let Some(stats) = &self.stats {
+            let mut stats = stats.lock().expect("torch tensor stats mutex poisoned");
+            stats.calls += 1;
+            stats.bytes += tensor.data_len();
+            stats.elapsed += start.elapsed();
+            match (&tensor.source_type, tensor.transpose) {
+                (TensorType::Float16, false) => {
+                    stats.direct_calls += 1;
+                    stats.direct_bytes += tensor.data_len();
+                }
+                (_, true) => {
+                    stats.transpose_calls += 1;
+                    stats.transpose_bytes += tensor.data_len();
+                }
+                _ => {
+                    stats.convert_calls += 1;
+                    stats.convert_bytes += tensor.data_len();
+                    match tensor.source_type {
+                        TensorType::Float32 => {
+                            stats.convert_f32_calls += 1;
+                            stats.convert_f32_bytes += tensor.data_len();
+                        }
+                        TensorType::BFloat16 => {
+                            stats.convert_bf16_calls += 1;
+                            stats.convert_bf16_bytes += tensor.data_len();
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        Ok((Dtype::F16, tensor.shape.clone(), data))
     }
 }
 
@@ -796,12 +864,146 @@ fn transpose_last_two(
     Ok(transposed)
 }
 
+const PARALLEL_CONVERT_MIN_ELEMENTS: usize = 4 * 1024 * 1024;
+const MAX_PARALLEL_CONVERT_THREADS: usize = 16;
+const CONVERT_THREAD_STACK_SIZE: usize = 256 * 1024;
+
+fn parallel_workers(len: usize) -> usize {
+    let available = std::thread::available_parallelism()
+        .map(|parallelism| parallelism.get())
+        .unwrap_or(1);
+    if available <= 1 || len < PARALLEL_CONVERT_MIN_ELEMENTS {
+        return 1;
+    }
+    let chunks = len.div_ceil(PARALLEL_CONVERT_MIN_ELEMENTS);
+    available
+        .min(MAX_PARALLEL_CONVERT_THREADS)
+        .min(chunks)
+        .max(1)
+}
+
+fn convert_thread_pool() -> &'static ThreadPool {
+    CONVERT_THREAD_POOL.get_or_init(|| {
+        let workers = std::thread::available_parallelism()
+            .map(|parallelism| parallelism.get())
+            .unwrap_or(1)
+            .min(MAX_PARALLEL_CONVERT_THREADS)
+            .max(1);
+        ThreadPoolBuilder::new()
+            .num_threads(workers)
+            .stack_size(CONVERT_THREAD_STACK_SIZE)
+            .thread_name(|index| format!("web-rwkv-convert-{index}"))
+            .build()
+            .expect("conversion thread pool")
+    })
+}
+
+fn parallel_convert_bf16_to_f16(src: &[bf16]) -> Vec<f16> {
+    let workers = parallel_workers(src.len());
+    if workers == 1 {
+        let mut out = uninit_f16_buffer(src.len());
+        convert_bf16_to_f16_into(&mut out, src);
+        return unsafe { assume_init_f16_buffer(out) };
+    }
+
+    let chunk_len = src.len().div_ceil(workers);
+    let mut out = uninit_f16_buffer(src.len());
+    convert_thread_pool().install(|| {
+        out.par_chunks_mut(chunk_len)
+            .zip(src.par_chunks(chunk_len))
+            .for_each(|(dst, src)| {
+                convert_bf16_to_f16_into(dst, src);
+            });
+    });
+    unsafe { assume_init_f16_buffer(out) }
+}
+
+fn parallel_convert_f32_to_f16(src: &[f32]) -> Vec<f16> {
+    let workers = parallel_workers(src.len());
+    if workers == 1 {
+        let mut out = vec![f16::ZERO; src.len()];
+        out.convert_from_f32_slice(src);
+        return out;
+    }
+
+    let chunk_len = src.len().div_ceil(workers);
+    let mut out = vec![f16::ZERO; src.len()];
+    convert_thread_pool().install(|| {
+        out.par_chunks_mut(chunk_len)
+            .zip(src.par_chunks(chunk_len))
+            .for_each(|(dst, src)| {
+                dst.convert_from_f32_slice(src);
+            });
+    });
+    out
+}
+
 fn f16_vec_into_bytes(data: Vec<f16>) -> Vec<u8> {
     let mut data = ManuallyDrop::new(data);
     let len = data.len() * size_of::<f16>();
     let cap = data.capacity() * size_of::<f16>();
     let ptr = data.as_mut_ptr() as *mut u8;
     unsafe { Vec::from_raw_parts(ptr, len, cap) }
+}
+
+fn uninit_f16_buffer(len: usize) -> Vec<MaybeUninit<f16>> {
+    let mut out = Vec::with_capacity(len);
+    unsafe {
+        // `MaybeUninit<f16>` may hold uninitialized elements until each slot is written.
+        out.set_len(len);
+    }
+    out
+}
+
+unsafe fn assume_init_f16_buffer(data: Vec<MaybeUninit<f16>>) -> Vec<f16> {
+    let mut data = ManuallyDrop::new(data);
+    // All call sites fully initialize every element before reinterpreting the buffer as `Vec<f16>`.
+    unsafe { Vec::from_raw_parts(data.as_mut_ptr().cast::<f16>(), data.len(), data.capacity()) }
+}
+
+fn convert_bf16_to_f16_into(dst: &mut [MaybeUninit<f16>], src: &[bf16]) {
+    debug_assert_eq!(dst.len(), src.len());
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("f16c") {
+            unsafe {
+                convert_bf16_to_f16_into_x86_avx2(dst, src);
+            }
+            return;
+        }
+    }
+
+    convert_bf16_to_f16_into_scalar(dst, src);
+}
+
+fn convert_bf16_to_f16_into_scalar(dst: &mut [MaybeUninit<f16>], src: &[bf16]) {
+    for (dst, src) in dst.iter_mut().zip(src.iter()) {
+        dst.write(f16::from_f32(src.to_f32()));
+    }
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2,f16c")]
+unsafe fn convert_bf16_to_f16_into_x86_avx2(dst: &mut [MaybeUninit<f16>], src: &[bf16]) {
+    debug_assert_eq!(dst.len(), src.len());
+
+    let src_bits: &[u16] = bytemuck::cast_slice(src);
+    let mut offset = 0;
+
+    while offset + 8 <= src_bits.len() {
+        let src_ptr = unsafe { src_bits.as_ptr().add(offset) } as *const __m128i;
+        let dst_ptr = unsafe { dst.as_mut_ptr().add(offset) } as *mut __m128i;
+        let packed = unsafe { _mm_loadu_si128(src_ptr) };
+        let widened = _mm256_cvtepu16_epi32(packed);
+        let shifted = _mm256_slli_epi32(widened, 16);
+        let values = _mm256_castsi256_ps(shifted);
+        let halves = _mm256_cvtps_ph(values, _MM_FROUND_TO_NEAREST_INT);
+        unsafe { _mm_storeu_si128(dst_ptr, halves) };
+        offset += 8;
+    }
+
+    convert_bf16_to_f16_into_scalar(&mut dst[offset..], &src[offset..]);
 }
 
 pub const RENAME: [(&str, &str); 4] = [
@@ -1734,5 +1936,313 @@ pub unsafe extern "C" fn get_model_info() -> ModelInfoOutput {
         num_emb: info.num_emb,
         num_vocab: info.num_vocab,
         num_head: info.num_head,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{env, ffi::CString, time::Instant};
+
+    fn env_usize(name: &str, default: usize) -> usize {
+        env::var(name)
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(default)
+    }
+
+    fn env_bool(name: &str, default: bool) -> bool {
+        env::var(name)
+            .ok()
+            .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+            .unwrap_or(default)
+    }
+
+    #[test]
+    fn bf16_to_f16_matches_scalar_for_all_bit_patterns() {
+        let src: Vec<bf16> = (u16::MIN..=u16::MAX).map(bf16::from_bits).collect();
+        let expected: Vec<u16> = src
+            .iter()
+            .map(|value| f16::from_f32(value.to_f32()).to_bits())
+            .collect();
+        let mut actual = uninit_f16_buffer(src.len());
+        convert_bf16_to_f16_into(&mut actual, &src);
+        let actual = unsafe { assume_init_f16_buffer(actual) };
+        let actual: Vec<u16> = actual.into_iter().map(f16::to_bits).collect();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    #[ignore = "manual benchmark for load_pth wall-clock time"]
+    fn bench_load_pth() {
+        let model = env::var("WEB_RWKV_BENCH_MODEL")
+            .unwrap_or_else(|_| "/models/rwkv7-g1f-13.3b-20260415-ctx8192.pth".to_string());
+        let quant = env_usize("WEB_RWKV_BENCH_QUANT", 0);
+        let quant_nf4 = env_usize("WEB_RWKV_BENCH_QUANT_NF4", 0);
+        let quant_sf4 = env_usize("WEB_RWKV_BENCH_QUANT_SF4", 0);
+        let fp16 = env_bool("WEB_RWKV_BENCH_FP16", true);
+        let batch = env_usize("WEB_RWKV_BENCH_BATCH", 1);
+        let model =
+            CString::new(model.clone()).expect("benchmark model path should not contain NUL");
+
+        init(0);
+
+        let start = Instant::now();
+        let ret = unsafe {
+            load_pth(
+                model.as_ptr(),
+                quant,
+                quant_nf4,
+                quant_sf4,
+                fp16,
+                batch,
+                None,
+            )
+        };
+        let elapsed = start.elapsed();
+
+        assert_eq!(ret, 0, "load_pth failed for {model:?}");
+        eprintln!(
+            "load_pth elapsed={:.3}s quant={quant} quant_nf4={quant_nf4} quant_sf4={quant_sf4} fp16={fp16} batch={batch}",
+            elapsed.as_secs_f64(),
+        );
+
+        unsafe { release() };
+    }
+
+    #[test]
+    #[ignore = "manual benchmark for safetensors load wall-clock time"]
+    fn bench_load_st() {
+        let model = env::var("WEB_RWKV_BENCH_MODEL").unwrap_or_else(|_| {
+            "/home/molly/dist/assets/models/rwkv7-g1e-7.2b-20260301-ctx8192.st".to_string()
+        });
+        let quant = env_usize("WEB_RWKV_BENCH_QUANT", 0);
+        let quant_nf4 = env_usize("WEB_RWKV_BENCH_QUANT_NF4", 0);
+        let quant_sf4 = env_usize("WEB_RWKV_BENCH_QUANT_SF4", 0);
+        let fp16 = env_bool("WEB_RWKV_BENCH_FP16", true);
+        let batch = env_usize("WEB_RWKV_BENCH_BATCH", 1);
+        let model =
+            CString::new(model.clone()).expect("benchmark model path should not contain NUL");
+
+        init(0);
+
+        let start = Instant::now();
+        let ret = unsafe { load(model.as_ptr(), quant, quant_nf4, quant_sf4, fp16, batch) };
+        let elapsed = start.elapsed();
+
+        assert_eq!(ret, 0, "load failed for {model:?}");
+        eprintln!(
+            "load_st elapsed={:.3}s quant={quant} quant_nf4={quant_nf4} quant_sf4={quant_sf4} fp16={fp16} batch={batch}",
+            elapsed.as_secs_f64(),
+        );
+
+        unsafe { release() };
+    }
+
+    async fn bench_build_from_reader<R: Reader>(
+        context: &Context,
+        model: R,
+        info: ModelInfo,
+        quant: usize,
+        quant_nf4: usize,
+        quant_sf4: usize,
+        fp16: bool,
+        batch: usize,
+    ) {
+        let quant = (0..quant)
+            .map(|layer| (layer, Quant::Int8))
+            .chain((0..quant_nf4).map(|layer| (layer, Quant::NF4)))
+            .chain((0..quant_sf4).map(|layer| (layer, Quant::SF4)))
+            .collect();
+        let builder = ModelBuilder::new(context, model).quant(quant);
+
+        match info.version {
+            ModelVersion::V4 => {
+                let start = Instant::now();
+                if fp16 {
+                    let model = builder.build_v4().await.expect("build_v4");
+                    eprintln!("phase build_v4 {:.3}s", start.elapsed().as_secs_f64());
+                    let bundle = v4::Bundle::<f16>::new(model, batch);
+                    let _state = bundle.state();
+                    let start = Instant::now();
+                    let _runtime: TokioRuntime<Rnn> = TokioRuntime::new(bundle).await;
+                    eprintln!("phase runtime_new {:.3}s", start.elapsed().as_secs_f64());
+                } else {
+                    let model = builder.build_v4().await.expect("build_v4");
+                    eprintln!("phase build_v4 {:.3}s", start.elapsed().as_secs_f64());
+                    let bundle = v4::Bundle::<f32>::new(model, batch);
+                    let _state = bundle.state();
+                    let start = Instant::now();
+                    let _runtime: TokioRuntime<Rnn> = TokioRuntime::new(bundle).await;
+                    eprintln!("phase runtime_new {:.3}s", start.elapsed().as_secs_f64());
+                }
+            }
+            ModelVersion::V5 => {
+                let start = Instant::now();
+                if fp16 {
+                    let model = builder.build_v5().await.expect("build_v5");
+                    eprintln!("phase build_v5 {:.3}s", start.elapsed().as_secs_f64());
+                    let bundle = v5::Bundle::<f16>::new(model, batch);
+                    let _state = bundle.state();
+                    let start = Instant::now();
+                    let _runtime: TokioRuntime<Rnn> = TokioRuntime::new(bundle).await;
+                    eprintln!("phase runtime_new {:.3}s", start.elapsed().as_secs_f64());
+                } else {
+                    let model = builder.build_v5().await.expect("build_v5");
+                    eprintln!("phase build_v5 {:.3}s", start.elapsed().as_secs_f64());
+                    let bundle = v5::Bundle::<f32>::new(model, batch);
+                    let _state = bundle.state();
+                    let start = Instant::now();
+                    let _runtime: TokioRuntime<Rnn> = TokioRuntime::new(bundle).await;
+                    eprintln!("phase runtime_new {:.3}s", start.elapsed().as_secs_f64());
+                }
+            }
+            ModelVersion::V6 => {
+                let start = Instant::now();
+                if fp16 {
+                    let model = builder.build_v6().await.expect("build_v6");
+                    eprintln!("phase build_v6 {:.3}s", start.elapsed().as_secs_f64());
+                    let bundle = v6::Bundle::<f16>::new(model, batch);
+                    let _state = bundle.state();
+                    let start = Instant::now();
+                    let _runtime: TokioRuntime<Rnn> = TokioRuntime::new(bundle).await;
+                    eprintln!("phase runtime_new {:.3}s", start.elapsed().as_secs_f64());
+                } else {
+                    let model = builder.build_v6().await.expect("build_v6");
+                    eprintln!("phase build_v6 {:.3}s", start.elapsed().as_secs_f64());
+                    let bundle = v6::Bundle::<f32>::new(model, batch);
+                    let _state = bundle.state();
+                    let start = Instant::now();
+                    let _runtime: TokioRuntime<Rnn> = TokioRuntime::new(bundle).await;
+                    eprintln!("phase runtime_new {:.3}s", start.elapsed().as_secs_f64());
+                }
+            }
+            ModelVersion::V7 => {
+                let start = Instant::now();
+                if fp16 {
+                    let model = builder.build_v7().await.expect("build_v7");
+                    eprintln!("phase build_v7 {:.3}s", start.elapsed().as_secs_f64());
+                    let bundle = v7::Bundle::<f16>::new(model, batch);
+                    let _state = bundle.state();
+                    let start = Instant::now();
+                    let _runtime: TokioRuntime<Rnn> = TokioRuntime::new(bundle).await;
+                    eprintln!("phase runtime_new {:.3}s", start.elapsed().as_secs_f64());
+                } else {
+                    let model = builder.build_v7().await.expect("build_v7");
+                    eprintln!("phase build_v7 {:.3}s", start.elapsed().as_secs_f64());
+                    let bundle = v7::Bundle::<f32>::new(model, batch);
+                    let _state = bundle.state();
+                    let start = Instant::now();
+                    let _runtime: TokioRuntime<Rnn> = TokioRuntime::new(bundle).await;
+                    eprintln!("phase runtime_new {:.3}s", start.elapsed().as_secs_f64());
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "manual benchmark for load_pth phase timings"]
+    fn bench_load_pth_phases() {
+        let model = env::var("WEB_RWKV_BENCH_MODEL")
+            .unwrap_or_else(|_| "/models/rwkv7-g1f-7.2b-20260414-ctx8192.pth".to_string());
+        let quant = env_usize("WEB_RWKV_BENCH_QUANT", 0);
+        let quant_nf4 = env_usize("WEB_RWKV_BENCH_QUANT_NF4", 0);
+        let quant_sf4 = env_usize("WEB_RWKV_BENCH_QUANT_SF4", 0);
+        let fp16 = env_bool("WEB_RWKV_BENCH_FP16", true);
+        let batch = env_usize("WEB_RWKV_BENCH_BATCH", 1);
+
+        init(0);
+
+        let total_start = Instant::now();
+        let tokio = Arc::new(tokio::runtime::Runtime::new().expect("tokio runtime"));
+        let _tokio = tokio.clone();
+        let stats = Arc::new(Mutex::new(TorchTensorStats::default()));
+
+        _tokio.block_on(async move {
+            let start = Instant::now();
+            let model = TorchReader::new_with_stats(&model, None, Some(stats.clone()))
+                .expect("torch reader");
+            eprintln!(
+                "phase torch_reader_new {:.3}s",
+                start.elapsed().as_secs_f64()
+            );
+
+            let start = Instant::now();
+            let info = Loader::info(&model).expect("loader info");
+            eprintln!("phase loader_info {:.3}s", start.elapsed().as_secs_f64());
+
+            let start = Instant::now();
+            let context = create_context(&info).await.expect("context");
+            eprintln!("phase create_context {:.3}s", start.elapsed().as_secs_f64());
+            bench_build_from_reader(
+                &context, model, info, quant, quant_nf4, quant_sf4, fp16, batch,
+            )
+            .await;
+
+            let stats = stats.lock().expect("torch tensor stats mutex poisoned");
+            eprintln!(
+                "reader_stats calls={} bytes={} direct_calls={} direct_bytes={} convert_calls={} convert_bytes={} convert_f32_calls={} convert_f32_bytes={} convert_bf16_calls={} convert_bf16_bytes={} transpose_calls={} transpose_bytes={} reader_tensor_time={:.3}s",
+                stats.calls,
+                stats.bytes,
+                stats.direct_calls,
+                stats.direct_bytes,
+                stats.convert_calls,
+                stats.convert_bytes,
+                stats.convert_f32_calls,
+                stats.convert_f32_bytes,
+                stats.convert_bf16_calls,
+                stats.convert_bf16_bytes,
+                stats.transpose_calls,
+                stats.transpose_bytes,
+                stats.elapsed.as_secs_f64(),
+            );
+
+            eprintln!("phase total {:.3}s", total_start.elapsed().as_secs_f64());
+        });
+    }
+
+    #[test]
+    #[ignore = "manual benchmark for safetensors load phase timings"]
+    fn bench_load_st_phases() {
+        let model = env::var("WEB_RWKV_BENCH_MODEL").unwrap_or_else(|_| {
+            "/home/molly/dist/assets/models/rwkv7-g1e-7.2b-20260301-ctx8192.st".to_string()
+        });
+        let quant = env_usize("WEB_RWKV_BENCH_QUANT", 0);
+        let quant_nf4 = env_usize("WEB_RWKV_BENCH_QUANT_NF4", 0);
+        let quant_sf4 = env_usize("WEB_RWKV_BENCH_QUANT_SF4", 0);
+        let fp16 = env_bool("WEB_RWKV_BENCH_FP16", true);
+        let batch = env_usize("WEB_RWKV_BENCH_BATCH", 1);
+
+        init(0);
+
+        let total_start = Instant::now();
+        let tokio = Arc::new(tokio::runtime::Runtime::new().expect("tokio runtime"));
+        let _tokio = tokio.clone();
+
+        _tokio.block_on(async move {
+            let start = Instant::now();
+            let file = File::open(&model).await.expect("open safetensors");
+            let data = unsafe { Mmap::map(&file).expect("mmap safetensors") };
+            eprintln!("phase open_mmap {:.3}s", start.elapsed().as_secs_f64());
+
+            let start = Instant::now();
+            let model = SafeTensors::deserialize(&data).expect("deserialize safetensors");
+            eprintln!("phase deserialize_st {:.3}s", start.elapsed().as_secs_f64());
+
+            let start = Instant::now();
+            let info = Loader::info(&model).expect("loader info");
+            eprintln!("phase loader_info {:.3}s", start.elapsed().as_secs_f64());
+
+            let start = Instant::now();
+            let context = create_context(&info).await.expect("context");
+            eprintln!("phase create_context {:.3}s", start.elapsed().as_secs_f64());
+
+            bench_build_from_reader(
+                &context, model, info, quant, quant_nf4, quant_sf4, fp16, batch,
+            )
+            .await;
+
+            eprintln!("phase total {:.3}s", total_start.elapsed().as_secs_f64());
+        });
     }
 }
