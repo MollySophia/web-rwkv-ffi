@@ -24,7 +24,7 @@ use rayon::{
 use repugnant_pickle::{RepugnantTorchTensors as TorchTensors, TensorType};
 use safetensors::View;
 use safetensors::{Dtype, SafeTensors};
-use serde::{de::DeserializeSeed, Deserialize};
+use serde::{de::DeserializeSeed, Deserialize, Serialize};
 #[cfg(windows)]
 use std::ffi::c_void;
 use tokio::fs::File;
@@ -57,8 +57,37 @@ struct WktvRuntime {
     runtime: TokioRuntime<Rnn>,
     info: ModelInfo,
     state: Arc<dyn State + Sync + Send + 'static>,
+    model: Arc<dyn ModelSerialize + Sync + Send + 'static>,
     context: Context,
     tokio: Arc<tokio::runtime::Runtime>,
+}
+
+struct Model<M>(M);
+
+trait ModelSerialize {
+    fn serialize(&self, file: std::fs::File) -> Result<()>;
+}
+
+impl<M: Serialize> ModelSerialize for Model<M> {
+    fn serialize(&self, file: std::fs::File) -> Result<()> {
+        use cbor4ii::{core::enc::Write, serde::Serializer};
+        use std::{fs::File, io::Write as _};
+
+        struct FileWriter(File);
+
+        impl Write for FileWriter {
+            type Error = std::io::Error;
+
+            fn push(&mut self, input: &[u8]) -> Result<(), Self::Error> {
+                self.0.write_all(input)
+            }
+        }
+
+        let file = FileWriter(file);
+        let mut serializer = Serializer::new(file);
+        self.0.serialize(&mut serializer)?;
+        Ok(())
+    }
 }
 
 fn make_hooks_extended_v6<F: Float>(info: &ModelInfo) -> Result<v6::HookMap<F>> {
@@ -100,6 +129,36 @@ fn make_hooks_extended_v7<F: Float>(info: &ModelInfo) -> Result<v7::HookMap<F>> 
 #[derive(Debug, Deserialize)]
 struct Prefab {
     info: ModelInfo,
+}
+
+fn bundle_artifacts<B: Bundle>(
+    bundle: &B,
+) -> (
+    Arc<dyn State + Sync + Send + 'static>,
+    Arc<dyn ModelSerialize + Sync + Send + 'static>,
+) {
+    let state: Arc<dyn State + Sync + Send + 'static> = Arc::new(bundle.state());
+    let model: Arc<dyn ModelSerialize + Sync + Send + 'static> = Arc::new(Model(bundle.model()));
+    (state, model)
+}
+
+fn serialize_model_as_prefab(
+    model: &(dyn ModelSerialize + Sync + Send + 'static),
+    output: impl AsRef<Path>,
+) -> Result<()> {
+    let file = std::fs::File::create(output)?;
+    model.serialize(file)
+}
+
+fn save_loaded_prefab(output: impl AsRef<Path>) -> Result<()> {
+    let model = {
+        let runtime = RUNTIME.read().unwrap();
+        let Some(runtime) = runtime.as_ref() else {
+            anyhow::bail!("runtime not loaded");
+        };
+        runtime.model.clone()
+    };
+    serialize_model_as_prefab(model.as_ref(), output)
 }
 
 async fn create_context(info: &ModelInfo) -> Result<Context> {
@@ -179,24 +238,26 @@ fn load_runtime(
                 if fp16 {
                     let model = builder.build_v4().await?;
                     let bundle = v4::Bundle::<f16>::new(model, batch);
-                    let state = Arc::new(bundle.state());
+                    let (state, model) = bundle_artifacts(&bundle);
                     let runtime = TokioRuntime::new(bundle).await;
                     WktvRuntime {
                         runtime,
                         info,
                         state,
+                        model,
                         context,
                         tokio,
                     }
                 } else {
                     let model = builder.build_v4().await?;
                     let bundle = v4::Bundle::<f32>::new(model, batch);
-                    let state = Arc::new(bundle.state());
+                    let (state, model) = bundle_artifacts(&bundle);
                     let runtime = TokioRuntime::new(bundle).await;
                     WktvRuntime {
                         runtime,
                         info,
                         state,
+                        model,
                         context,
                         tokio,
                     }
@@ -206,24 +267,26 @@ fn load_runtime(
                 if fp16 {
                     let model = builder.build_v5().await?;
                     let bundle = v5::Bundle::<f16>::new(model, batch);
-                    let state = Arc::new(bundle.state());
+                    let (state, model) = bundle_artifacts(&bundle);
                     let runtime = TokioRuntime::new(bundle).await;
                     WktvRuntime {
                         runtime,
                         info,
                         state,
+                        model,
                         context,
                         tokio,
                     }
                 } else {
                     let model = builder.build_v5().await?;
                     let bundle = v5::Bundle::<f32>::new(model, batch);
-                    let state = Arc::new(bundle.state());
+                    let (state, model) = bundle_artifacts(&bundle);
                     let runtime = TokioRuntime::new(bundle).await;
                     WktvRuntime {
                         runtime,
                         info,
                         state,
+                        model,
                         context,
                         tokio,
                     }
@@ -239,12 +302,13 @@ fn load_runtime(
                         }
                         false => v6::Bundle::<f16>::new(model, batch),
                     };
-                    let state = Arc::new(bundle.state());
+                    let (state, model) = bundle_artifacts(&bundle);
                     let runtime = TokioRuntime::new(bundle).await;
                     WktvRuntime {
                         runtime,
                         info,
                         state,
+                        model,
                         context,
                         tokio,
                     }
@@ -257,12 +321,13 @@ fn load_runtime(
                         }
                         false => v6::Bundle::<f32>::new(model, batch),
                     };
-                    let state = Arc::new(bundle.state());
+                    let (state, model) = bundle_artifacts(&bundle);
                     let runtime = TokioRuntime::new(bundle).await;
                     WktvRuntime {
                         runtime,
                         info,
                         state,
+                        model,
                         context,
                         tokio,
                     }
@@ -278,12 +343,13 @@ fn load_runtime(
                         }
                         false => v7::Bundle::<f16>::new(model, batch),
                     };
-                    let state = Arc::new(bundle.state());
+                    let (state, model) = bundle_artifacts(&bundle);
                     let runtime = TokioRuntime::new(bundle).await;
                     WktvRuntime {
                         runtime,
                         info,
                         state,
+                        model,
                         context,
                         tokio,
                     }
@@ -296,12 +362,13 @@ fn load_runtime(
                         }
                         false => v7::Bundle::<f32>::new(model, batch),
                     };
-                    let state = Arc::new(bundle.state());
+                    let (state, model) = bundle_artifacts(&bundle);
                     let runtime = TokioRuntime::new(bundle).await;
                     WktvRuntime {
                         runtime,
                         info,
                         state,
+                        model,
                         context,
                         tokio,
                     }
@@ -334,13 +401,14 @@ fn load_runtime_prefab(model: impl AsRef<Path>, fp16: bool, batch: usize) -> Res
                     let seed: Seed<_, v4::Model> = Seed::new(&context);
                     let model = seed.deserialize(&mut deserializer)?;
                     let bundle = v4::Bundle::<f16>::new(model, batch);
-                    let state = Arc::new(bundle.state());
+                    let (state, model) = bundle_artifacts(&bundle);
                     let runtime = TokioRuntime::new(bundle).await;
 
                     WktvRuntime {
                         runtime,
                         info,
                         state,
+                        model,
                         context,
                         tokio,
                     }
@@ -348,13 +416,14 @@ fn load_runtime_prefab(model: impl AsRef<Path>, fp16: bool, batch: usize) -> Res
                     let seed: Seed<_, v4::Model> = Seed::new(&context);
                     let model = seed.deserialize(&mut deserializer)?;
                     let bundle = v4::Bundle::<f32>::new(model, batch);
-                    let state = Arc::new(bundle.state());
+                    let (state, model) = bundle_artifacts(&bundle);
                     let runtime = TokioRuntime::new(bundle).await;
 
                     WktvRuntime {
                         runtime,
                         info,
                         state,
+                        model,
                         context,
                         tokio,
                     }
@@ -365,13 +434,14 @@ fn load_runtime_prefab(model: impl AsRef<Path>, fp16: bool, batch: usize) -> Res
                     let seed: Seed<_, v5::Model> = Seed::new(&context);
                     let model = seed.deserialize(&mut deserializer)?;
                     let bundle = v5::Bundle::<f16>::new(model, batch);
-                    let state = Arc::new(bundle.state());
+                    let (state, model) = bundle_artifacts(&bundle);
                     let runtime = TokioRuntime::new(bundle).await;
 
                     WktvRuntime {
                         runtime,
                         info,
                         state,
+                        model,
                         context,
                         tokio,
                     }
@@ -379,13 +449,14 @@ fn load_runtime_prefab(model: impl AsRef<Path>, fp16: bool, batch: usize) -> Res
                     let seed: Seed<_, v5::Model> = Seed::new(&context);
                     let model = seed.deserialize(&mut deserializer)?;
                     let bundle = v5::Bundle::<f32>::new(model, batch);
-                    let state = Arc::new(bundle.state());
+                    let (state, model) = bundle_artifacts(&bundle);
                     let runtime = TokioRuntime::new(bundle).await;
 
                     WktvRuntime {
                         runtime,
                         info,
                         state,
+                        model,
                         context,
                         tokio,
                     }
@@ -396,13 +467,14 @@ fn load_runtime_prefab(model: impl AsRef<Path>, fp16: bool, batch: usize) -> Res
                     let seed: Seed<_, v6::Model> = Seed::new(&context);
                     let model = seed.deserialize(&mut deserializer)?;
                     let bundle = v6::Bundle::<f16>::new(model, batch);
-                    let state = Arc::new(bundle.state());
+                    let (state, model) = bundle_artifacts(&bundle);
                     let runtime = TokioRuntime::new(bundle).await;
 
                     WktvRuntime {
                         runtime,
                         info,
                         state,
+                        model,
                         context,
                         tokio,
                     }
@@ -410,13 +482,14 @@ fn load_runtime_prefab(model: impl AsRef<Path>, fp16: bool, batch: usize) -> Res
                     let seed: Seed<_, v6::Model> = Seed::new(&context);
                     let model = seed.deserialize(&mut deserializer)?;
                     let bundle = v6::Bundle::<f32>::new(model, batch);
-                    let state = Arc::new(bundle.state());
+                    let (state, model) = bundle_artifacts(&bundle);
                     let runtime = TokioRuntime::new(bundle).await;
 
                     WktvRuntime {
                         runtime,
                         info,
                         state,
+                        model,
                         context,
                         tokio,
                     }
@@ -427,13 +500,14 @@ fn load_runtime_prefab(model: impl AsRef<Path>, fp16: bool, batch: usize) -> Res
                     let seed: Seed<_, v7::Model> = Seed::new(&context);
                     let model = seed.deserialize(&mut deserializer)?;
                     let bundle = v7::Bundle::<f16>::new(model, batch);
-                    let state = Arc::new(bundle.state());
+                    let (state, model) = bundle_artifacts(&bundle);
                     let runtime = TokioRuntime::new(bundle).await;
 
                     WktvRuntime {
                         runtime,
                         info,
                         state,
+                        model,
                         context,
                         tokio,
                     }
@@ -441,13 +515,14 @@ fn load_runtime_prefab(model: impl AsRef<Path>, fp16: bool, batch: usize) -> Res
                     let seed: Seed<_, v7::Model> = Seed::new(&context);
                     let model = seed.deserialize(&mut deserializer)?;
                     let bundle = v7::Bundle::<f32>::new(model, batch);
-                    let state = Arc::new(bundle.state());
+                    let (state, model) = bundle_artifacts(&bundle);
                     let runtime = TokioRuntime::new(bundle).await;
 
                     WktvRuntime {
                         runtime,
                         info,
                         state,
+                        model,
                         context,
                         tokio,
                     }
@@ -1069,24 +1144,26 @@ fn load_runtime_pth(
                     if fp16 {
                         let model = builder.build_v4().await?;
                         let bundle = v4::Bundle::<f16>::new(model, batch);
-                        let state = Arc::new(bundle.state());
+                        let (state, model) = bundle_artifacts(&bundle);
                         let runtime = TokioRuntime::new(bundle).await;
                         WktvRuntime {
                             runtime,
                             info,
                             state,
+                            model,
                             context,
                             tokio,
                         }
                     } else {
                         let model = builder.build_v4().await?;
                         let bundle = v4::Bundle::<f32>::new(model, batch);
-                        let state = Arc::new(bundle.state());
+                        let (state, model) = bundle_artifacts(&bundle);
                         let runtime = TokioRuntime::new(bundle).await;
                         WktvRuntime {
                             runtime,
                             info,
                             state,
+                            model,
                             context,
                             tokio,
                         }
@@ -1096,24 +1173,26 @@ fn load_runtime_pth(
                     if fp16 {
                         let model = builder.build_v5().await?;
                         let bundle = v5::Bundle::<f16>::new(model, batch);
-                        let state = Arc::new(bundle.state());
+                        let (state, model) = bundle_artifacts(&bundle);
                         let runtime = TokioRuntime::new(bundle).await;
                         WktvRuntime {
                             runtime,
                             info,
                             state,
+                            model,
                             context,
                             tokio,
                         }
                     } else {
                         let model = builder.build_v5().await?;
                         let bundle = v5::Bundle::<f32>::new(model, batch);
-                        let state = Arc::new(bundle.state());
+                        let (state, model) = bundle_artifacts(&bundle);
                         let runtime = TokioRuntime::new(bundle).await;
                         WktvRuntime {
                             runtime,
                             info,
                             state,
+                            model,
                             context,
                             tokio,
                         }
@@ -1129,12 +1208,13 @@ fn load_runtime_pth(
                             }
                             false => v6::Bundle::<f16>::new(model, batch),
                         };
-                        let state = Arc::new(bundle.state());
+                        let (state, model) = bundle_artifacts(&bundle);
                         let runtime = TokioRuntime::new(bundle).await;
                         WktvRuntime {
                             runtime,
                             info,
                             state,
+                            model,
                             context,
                             tokio,
                         }
@@ -1147,12 +1227,13 @@ fn load_runtime_pth(
                             }
                             false => v6::Bundle::<f32>::new(model, batch),
                         };
-                        let state = Arc::new(bundle.state());
+                        let (state, model) = bundle_artifacts(&bundle);
                         let runtime = TokioRuntime::new(bundle).await;
                         WktvRuntime {
                             runtime,
                             info,
                             state,
+                            model,
                             context,
                             tokio,
                         }
@@ -1168,12 +1249,13 @@ fn load_runtime_pth(
                             }
                             false => v7::Bundle::<f16>::new(model, batch),
                         };
-                        let state = Arc::new(bundle.state());
+                        let (state, model) = bundle_artifacts(&bundle);
                         let runtime = TokioRuntime::new(bundle).await;
                         WktvRuntime {
                             runtime,
                             info,
                             state,
+                            model,
                             context,
                             tokio,
                         }
@@ -1186,12 +1268,13 @@ fn load_runtime_pth(
                             }
                             false => v7::Bundle::<f32>::new(model, batch),
                         };
-                        let state = Arc::new(bundle.state());
+                        let (state, model) = bundle_artifacts(&bundle);
                         let runtime = TokioRuntime::new(bundle).await;
                         WktvRuntime {
                             runtime,
                             info,
                             state,
+                            model,
                             context,
                             tokio,
                         }
@@ -1291,6 +1374,23 @@ pub unsafe extern "C" fn load_prefab(model: *const c_char, fp16: bool, batch: us
     }
 }
 
+/// Save the current loaded runtime as a prefab.
+///
+/// # Safety
+///
+/// The caller must ensure that `output_path` is valid.
+#[no_mangle]
+pub unsafe extern "C" fn save_prefab(output_path: *const c_char) -> i32 {
+    let output_path = unsafe { CStr::from_ptr(output_path).to_string_lossy().to_string() };
+    match save_loaded_prefab(output_path) {
+        Ok(()) => 0,
+        Err(err) => {
+            log::error!("{err}");
+            -1
+        }
+    }
+}
+
 /// Load a runtime from pth.
 ///
 /// # Safety
@@ -1355,6 +1455,68 @@ pub unsafe extern "C" fn convert_pth_to_st(
         }
     };
     ret
+}
+
+pub fn convert_prefab(
+    input: impl AsRef<Path>,
+    output: impl AsRef<Path>,
+    quant: usize,
+    quant_nf4: usize,
+    quant_sf4: usize,
+    fp16: bool,
+    batch: usize,
+    callback: Option<extern "C" fn(f32)>,
+) -> Result<()> {
+    let runtime = load_runtime_pth(
+        input,
+        quant,
+        quant_nf4,
+        quant_sf4,
+        None,
+        false,
+        fp16,
+        batch,
+        callback,
+    )?;
+    serialize_model_as_prefab(runtime.model.as_ref(), output)?;
+    Ok(())
+}
+
+/// Convert a pth file directly to a prefab file.
+///
+/// # Safety
+///
+/// The caller must ensure that `input_path` and `output_path` are valid.
+#[no_mangle]
+pub unsafe extern "C" fn convert_pth_to_prefab(
+    input_path: *const c_char,
+    output_path: *const c_char,
+    quant: usize,
+    quant_nf4: usize,
+    quant_sf4: usize,
+    fp16: bool,
+    batch: usize,
+    callback: Option<extern "C" fn(f32)>,
+) -> i32 {
+    let input_path = unsafe { CStr::from_ptr(input_path).to_string_lossy().to_string() };
+    let output_path = unsafe { CStr::from_ptr(output_path).to_string_lossy().to_string() };
+
+    match convert_prefab(
+        input_path,
+        output_path,
+        quant,
+        quant_nf4,
+        quant_sf4,
+        fp16,
+        batch,
+        callback,
+    ) {
+        Ok(()) => 0,
+        Err(err) => {
+            log::error!("{err}");
+            -1
+        }
+    }
 }
 
 /// Load a runtime with `rescale` layers specified.

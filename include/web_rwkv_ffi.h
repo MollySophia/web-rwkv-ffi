@@ -54,6 +54,8 @@ int load_pth(const char *model, uintptr_t quant, uintptr_t quant_nf4, uintptr_t 
 
 int load_prefab(const char *model, bool fp16, uintptr_t batch);
 
+int save_prefab(const char *output_path);
+
 int load_extended(const char *model, uintptr_t quant, uintptr_t quant_nf4, uintptr_t quant_sf4, bool fp16, uintptr_t batch);
 
 int load_with_rescale(const char *model, uintptr_t quant, uintptr_t quant_nf4, uintptr_t quant_sf4, uintptr_t rescale, bool fp16, uintptr_t batch);
@@ -104,6 +106,15 @@ void set_state(struct StateRaw state, uintptr_t batch);
 void free_state(struct StateRaw state);
 
 int convert_pth_to_st(const char *input_path, const char *output_path);
+
+int convert_pth_to_prefab(const char *input_path,
+                          const char *output_path,
+                          uintptr_t quant,
+                          uintptr_t quant_nf4,
+                          uintptr_t quant_sf4,
+                          bool fp16,
+                          uintptr_t batch,
+                          load_pth_progress_callback callback);
 
 #ifdef __cplusplus
 } // extern "C"
